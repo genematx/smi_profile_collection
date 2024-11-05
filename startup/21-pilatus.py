@@ -2,36 +2,24 @@ print(f"Loading {__file__}")
 
 from ophyd import (
     Component as Cpt,
-    ADComponent,
     Device,
-    PseudoPositioner,
     EpicsSignal,
     EpicsSignalRO,
     EpicsMotor,
     ROIPlugin,
-    ImagePlugin,
-    TIFFPlugin,
     TransformPlugin,
-    SingleTrigger,
     PilatusDetector,
     OverlayPlugin,
-    FilePlugin,
 )
 
-from ophyd.areadetector.filestore_mixins import FileStoreTIFFIterativeWrite
+
 from ophyd.areadetector.cam import PilatusDetectorCam
 from ophyd.areadetector.detectors import PilatusDetector
 from ophyd.areadetector.base import EpicsSignalWithRBV as SignalWithRBV
 
-from ophyd.utils import set_and_wait
-from databroker.assets.handlers_base import HandlerBase
-import os
 import bluesky.plans as bp
 import time
-from nslsii.ad33 import StatsPluginV33
-from nslsii.ad33 import SingleTriggerV33
-import pandas as pds
-
+from nslsii.ad33 import StatsPluginV33, SingleTriggerV33
 
 
 class StatsWCentroid(StatsPluginV33):
@@ -77,68 +65,6 @@ class PilatusDetector(PilatusDetector):
     cam = Cpt(PilatusDetectorCamV33, "cam1:")
 
 
-class TIFFPluginWithFileStore(TIFFPlugin, FileStoreTIFFIterativeWrite):
-    def __init__(self, *args, md=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._md = md
-<<<<<<< Updated upstream
-        self.__stage_cache = {}
-        self._asset_path = None
-=======
-        self._asset_path = ''
->>>>>>> Stashed changes
-
-    def describe(self):
-        ret = super().describe()
-        key = self.parent._image_name
-        color_mode = self.parent.cam.color_mode.get(as_string=True)
-        if color_mode == 'Mono':
-            ret[key]['shape'] = [
-                self.parent.cam.num_images.get(),
-                self.array_size.height.get(),
-                self.array_size.width.get()
-                ]
-
-        elif color_mode in ['RGB1', 'Bayer']:
-            ret[key]['shape'] = [self.parent.cam.num_images.get(), *self.array_size.get()]
-        else:
-            raise RuntimeError("SHould never be here")
-
-        cam_dtype = self.data_type.get(as_string=True)
-        type_map = {'UInt8': '|u1', 'UInt16': '<u2', 'Float32':'<f4', "Float64":'<f8', 'Int32':'<i4'}
-        if cam_dtype in type_map:
-            ret[key].setdefault('dtype_str', type_map[cam_dtype])
-
-        return ret
-
-    def get_frames_per_point(self):
-        ret = super().get_frames_per_point()
-        print('get_frames_per_point returns', ret)
-        return ret
-
-    def _update_paths(self):
-        self.write_path_template = self.root_path_str + "%Y/%m/%d/"
-        self.read_path_template = self.root_path_str + "%Y/%m/%d/"
-        self.reg_root = self.root_path_str
-
-    @property
-    def root_path_str(self):
-        return f"/nsls2/data/smi/proposals/{self._md['cycle']}/{self._md['data_session']}/assets/{self._asset_path}/"
-
-    def stage(self):
-<<<<<<< Updated upstream
-        if self._asset_path:
-            self._update_paths(self)
-        self.__stage_cache['file_path'] = self.file_path.get()
-        self.__stage_cache['file_name'] = self.file_name.get()
-        self.__stage_cache['next_file_num'] = self.file_number.get()
-=======
-        self._update_paths()
->>>>>>> Stashed changes
-        return super().stage()
-
-
-
 class Pilatus(SingleTriggerV33, PilatusDetector):
     tiff = Cpt(
         TIFFPluginWithFileStore,
@@ -148,13 +74,8 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
         root="/",
     )
 
-<<<<<<< Updated upstream
-    def __init__(self, *args, **kwargs):
-        self.asset_path = kwargs.pop("asset_path", None)
-=======
     def __init__(self, *args, asset_path, **kwargs):
         self.asset_path = asset_path
->>>>>>> Stashed changes
         super().__init__(*args, **kwargs)
         self.tiff._asset_path = self.asset_path
 
@@ -231,8 +152,6 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
         def _acq_done(*, data, pvname):
             nonlocal fail_count
             data.get()
-            #print(data)
-            #print(data.alarm_status)
             if data.alarm_status is not AlarmStatus.NO_ALARM:
 
                 if fail_count < 5:
@@ -279,9 +198,6 @@ def det_exposure_time(exp_t, meas_t=1, period_delay=0.001):
             waits.append(pil900KW.cam.num_images.set(int(meas_t / exp_t)))
             for w in waits:
                 w.wait()
-            # rayonix.cam.acquire_time.put(exp_t)
-            # rayonix.cam.acquire_period.put(exp_t+0.01)
-            # rayonix.cam.num_images.put(int(meas_t/exp_t))
     except:
         print('Problem with new exposure set, using old method')
         pil1M.cam.acquire_time.put(exp_t)
@@ -370,6 +286,7 @@ for detpos in [pil1m_pos]:
 
 
 #####################################################
+# ------ NOT TESTED AFTER DATA SECURITY CHANGES -----
 # Pilatus 300kw definition
 
 # pil300KW = Pilatus("XF:12IDC-ES:2{Det:300KW}", name="pil300KW", asset_path="pilatus300kw-1")  # , detector_id="WAXS")

@@ -19,6 +19,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=7", "ophyd", "numpy"]
+console = ["ipython>=9.5", "prompt-toolkit>=3.0.41,<4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

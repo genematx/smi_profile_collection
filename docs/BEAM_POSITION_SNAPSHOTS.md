@@ -61,7 +61,8 @@ RE(restore_beam_position_snapshot(
 
 ## Restore Rules
 
-- New snapshots (schema version 2) contain 68 items, including photon energy in eV
+- New snapshots (schema version 3) contain 85 items, including all 17 CRL motors,
+  photon energy in eV
   (`energy.energy`, group `energy`) and BPM3 gain/range (`xbpm3.range`, group `diagnostics`),
   using `XF:12IDB-BI:2{EM:BPM3}Range`.
 - DCM pitch and roll were already captured; they are now restorable, including from older
@@ -85,6 +86,8 @@ RE(restore_beam_position_snapshot(
   4. Mirror translations (`x`, `y`) across HFM, VFM, and VDM.
   5. Mirror pitch (`th`) across those mirrors.
   6. XBPM2 and XBPM3 positions (`x`, `y`, in the `diagnostics` group).
+  7. CRL body (`x`, `y`, `z`, `ph`, `th`, in the `crl` group).
+  8. All twelve CRL holders (`lens1` through `lens12`, also in the `crl` group).
 - Slit center and gap coordinates are kept in separate batches because they share blades.
 - XBPM positions are restored from both new snapshots and older snapshots that incorrectly
   marked these motors `restore=False`. Comparison and dry-run tables reflect this correction.
@@ -92,6 +95,8 @@ RE(restore_beam_position_snapshot(
   calculates their targets rather than restoring those entries independently.
 - Older snapshots do not contain photon energy or BPM3 gain. They remain readable, but these
   missing settings cannot be restored; save a new snapshot to capture them.
+- Snapshots from before schema version 3 have no CRL positions. Comparing them reports CRLs
+  as `missing saved`; restoring them does not move the CRLs.
 - `names`, `groups`, `exclude`, and `tolerance` still limit which moves enter each batch.
 - Bimorph voltages are restored after the motor batches with `move_voltages()`. Its uniform-offset
   fast path writes `SET-ALLSHIFT`; otherwise, it stages targets sequentially through `SET-VTRGT<n>`
@@ -101,6 +106,50 @@ RE(restore_beam_position_snapshot(
   this avoids applying stale target values to unselected channels.
 - Restore leaves the photon shutter closed and feedback disabled. It does not automatically
   reopen the shutter or re-enable feedback, including if a restore fails after closure.
+
+## Recording a Good CRL Focus
+
+A good-focus record is a **full beam-position snapshot**, including mirror positions and
+bimorph voltages, energy, SSA and other slit settings, BPM settings, and CRL positions.
+It uses the same Redis-backed `mdsave` storage, listing, comparison, and restore helpers.
+Readbacks are collected sequentially; save after alignment motion has settled.
+
+```python
+snap = save_beam_position_snapshot(
+    "good_focus_16p1keV_2026_10_15_1430",
+    crl_inserted=[3],
+    note="Best focus at sample with holder 3; alignment optimized",
+)
+```
+
+Each record includes its creation timestamp, operator, and note. Use a unique dated name
+for each good alignment: saving an existing name replaces that record. Omitting the name
+generates a name with the current date and time (to the second).
+
+All CRL body coordinates (`x`, `y`, `z`, `ph`, `th`) and all twelve holder readbacks are
+saved in `items`. The additional `crl_alignment` metadata records each holder's IN/OUT/UNKNOWN
+state and the measured `in_mm` for IN holders. `crl_inserted=[3]` explicitly declares holder 3
+IN and the other holders OUT; `crl_inserted=[]` declares all OUT. If omitted, the states use
+the device's current zero-centered insertion tolerance (normally `abs(readback) < 3 mm`).
+The record identifies whether these states were operator-declared or inferred. Unreadable
+or nonfinite positions are UNKNOWN, even when declared IN, and have no recorded IN position.
+
+```python
+snap["crl_alignment"]
+list_beam_position_snapshots()
+compare_beam_position_snapshot(snap["snapshot_name"])
+
+# Preview the full beam alignment, including mirrors, SSA, energy, and CRLs.
+restore_beam_position_snapshot(snap["snapshot_name"])
+
+# Restore that full alignment.
+RE(restore_beam_position_snapshot(snap["snapshot_name"], dry_run=False))
+```
+
+Restoration uses the exact saved motor readbacks for every holder, including OUT positions;
+it does not substitute nominal IN/OUT positions. The IN annotations retain the measured
+alignment context without changing the global nominal holder inventory. Existing selection
+filters apply: for example, `groups=["crl"]` limits a preview or restore to CRL motors.
 
 ## Diagnosing Bimorph Writes
 
@@ -145,6 +194,7 @@ reloading only the snapshot module will not update existing bimorph device metho
 
 ## Pending Testing
 
+- [ ] CRL body/holder capture, insertion annotations, and full-alignment restore under live conditions.
 - [ ] New snapshot energy (eV), BPM3 range enum, pitch, and roll values against live readbacks.
 - [ ] Feedback disables before shutter closure; closure is confirmed before any restore motion.
 - [ ] Closed-shutter energy restore with managed-energy preprocessing installed: feedback stays

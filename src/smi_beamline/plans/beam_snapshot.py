@@ -7,13 +7,17 @@ including DCM pitch/roll restoration. Bimorph diagnostics still need live testin
 from datetime import datetime, timezone
 import getpass
 import math
+from numbers import Integral
 
 from smi_beamline.devices.bimorph import N_BIMORPH_CH
 
 
 SNAPSHOT_KEY_PREFIX = "beam_position_snapshots"
 SNAPSHOT_INDEX_KEY = "beam_position_snapshots:index"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+_CRL_BODY_AXES = ("x", "y", "z", "ph", "th")
+_CRL_HOLDER_AXES = tuple("lens{}".format(i) for i in range(1, 13))
 
 # Keep coupled coordinates in separate batches; independent devices move together.
 _XBPM_POSITION_NAMES = tuple(
@@ -30,6 +34,8 @@ _MOTOR_RESTORE_BATCHES = (
                                   for dev in ("hfm", "vfm", "vdm") for axis in ("x", "y"))),
     ("mirror pitch", tuple("{}.th".format(dev) for dev in ("hfm", "vfm", "vdm"))),
     ("XBPM positions", _XBPM_POSITION_NAMES),
+    ("CRL body", tuple("crl.{}".format(axis) for axis in _CRL_BODY_AXES)),
+    ("CRL holders", tuple("crl.{}".format(axis) for axis in _CRL_HOLDER_AXES)),
 )
 
 
@@ -75,7 +81,8 @@ def _num(value):
     if isinstance(value, dict) and "error" in value:
         return None
     try:
-        return float(value)
+        value = float(value)
+        return value if math.isfinite(value) else None
     except Exception:
         return None
 
@@ -157,6 +164,9 @@ def _registry_from_namespace(ns):
         for axis in ("x", "y", "th"):
             entries.append(("{}.{}".format(dev_name, axis), "mirrors", getattr(dev, axis), True))
 
+    for axis in _CRL_BODY_AXES + _CRL_HOLDER_AXES:
+        entries.append(("crl.{}".format(axis), "crl", getattr(ns["crl"], axis), True))
+
     return entries
 
 
@@ -221,7 +231,43 @@ def _collect_snapshot_items(ns):
     return items
 
 
-def _snapshot_payload(name, ns, note=None):
+def _crl_inserted_numbers(inserted):
+    if inserted is None:
+        return None
+    numbers = list(inserted)
+    if any(isinstance(i, bool) or not isinstance(i, Integral) or not 1 <= i <= 12
+           for i in numbers):
+        raise ValueError("crl_inserted must contain holder numbers 1 through 12")
+    return {int(i) for i in numbers}
+
+
+def _crl_alignment(items, crl, inserted):
+    """Annotate the captured readbacks, without reading the holders a second time."""
+    by_name = {item["name"]: item for item in items}
+    tolerance = float(crl.inserted_tolerance_mm)
+    holders = []
+    for number in range(1, 13):
+        value = _num(by_name["crl.lens{}".format(number)]["readback"])
+        if value is None:
+            state = "UNKNOWN"
+        elif inserted is not None:
+            state = "IN" if number in inserted else "OUT"
+        else:
+            # Match CRL.read_lens_state(): the current status rule is centered on zero.
+            state = "IN" if abs(value) < tolerance else "OUT"
+        holders.append({"number": number, "state": state,
+                        "in_mm": value if state == "IN" else None})
+    return {
+        "state_source": "operator" if inserted is not None else "readback_zero_tolerance",
+        "declared_inserted": sorted(inserted) if inserted is not None else None,
+        "inserted_tolerance_mm": tolerance,
+        "holders": holders,
+    }
+
+
+def _snapshot_payload(name, ns, note=None, crl_inserted=None):
+    inserted = _crl_inserted_numbers(crl_inserted)
+    items = _collect_snapshot_items(ns)
     return {
         "schema_version": SCHEMA_VERSION,
         "snapshot_name": name,
@@ -229,7 +275,8 @@ def _snapshot_payload(name, ns, note=None):
         "beamline": "smi",
         "operator": getpass.getuser(),
         "note": note,
-        "items": _collect_snapshot_items(ns),
+        "items": items,
+        "crl_alignment": _crl_alignment(items, ns["crl"], inserted),
     }
 
 
@@ -249,13 +296,21 @@ def _store_snapshot(mdsave, snapshot):
     mdsave[SNAPSHOT_INDEX_KEY] = index
 
 
-def save_beam_position_snapshot(name=None, *, note=None, namespace=None, store=None):
-    """Save the current beam-positioning state into Redis-backed ``mdsave``."""
+def save_beam_position_snapshot(name=None, *, note=None, crl_inserted=None,
+                                namespace=None, store=None):
+    """Save the full beam-alignment state, including CRLs, into Redis-backed ``mdsave``.
+
+    ``crl_inserted`` optionally declares the inserted holder numbers (1..12); use
+    an empty list for all OUT. Otherwise states use the CRL's zero-centered insertion
+    tolerance. IN positions come from the captured motor readbacks. Every holder's
+    actual position is saved and restored, regardless of its IN/OUT annotation.
+    Names identify stored snapshots; reuse replaces the existing snapshot of that name.
+    """
     ns = namespace if namespace is not None else globals()
     if name is None:
         name = "beam_position_{}".format(datetime.now().strftime("%Y_%m_%d_%H%M%S"))
     mds = store if store is not None else ns["mdsave"]
-    snapshot = _snapshot_payload(str(name), ns, note=note)
+    snapshot = _snapshot_payload(str(name), ns, note=note, crl_inserted=crl_inserted)
     _store_snapshot(mds, snapshot)
     print("saved beam position snapshot {!r}: {} items".format(str(name), len(snapshot["items"])))
     return snapshot
@@ -422,7 +477,9 @@ def restore_beam_position_snapshot(snapshot_or_name, *, namespace=None, store=No
     Leave feedback off and the shutter closed afterwards, including on failure.
     Restore energy through its calculated real-axis targets with feedback off, then BPM3 gain.
     Motors move concurrently within ordered batches: DCM pitch/roll, slit centers, slit gaps, mirror
-    translations, mirror pitch, then XBPM positions.  Each batch finishes before the next starts.
+    translations, mirror pitch, XBPM positions, CRL body, then CRL holders.
+    Each batch finishes before the next starts. CRLs restore exact saved readbacks,
+    including OUT holders; insertion annotations do not generate nominal targets.
     XBPM positioning motors are restored even from older snapshots marked ``restore=False``;
     DCM pitch/roll are also restored from older snapshots. Raw Bragg/DCM/IVU gap entries remain
     comparison-only; energy restoration calculates these targets using the current energy
@@ -555,6 +612,7 @@ try:
     from smi_beamline.instances.mirrors import hfm, vfm, vdm, hfm_voltage, vfm_voltage  # noqa: F401
     from smi_beamline.instances.electrometers import xbpm3  # noqa: F401
     from smi_beamline.instances.shutter import ph_shutter  # noqa: F401
+    from smi_beamline.instances.crls import crl  # noqa: F401
 except Exception:
     # Keep import-clean for tests/offline use; callers can pass namespace/store explicitly.
     pass

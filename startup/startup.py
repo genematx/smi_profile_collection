@@ -102,34 +102,24 @@ class TiledInserter:
 
 tiled_inserter = TiledInserter()
 
-# Tiled 0.2 uses httpx for its in-process catalog client. Starlette still
-# supports it but emits this migration notice. Suppress only that notice,
-# locally; do not replace Tiled's HTTP stack or hide other startup warnings.
-import warnings as _warnings
-
-with _warnings.catch_warnings():
-    _warnings.filterwarnings(
-        "ignore",
-        message=r"^Using `httpx` with `starlette\.testclient` is deprecated; install `httpx2` instead\.$",
-        category=UserWarning,
-        module=r"^tiled\.client\.context$",
-    )
-    nslsii.configure_base(
-        _user_ns,
-        broker_name="smi",
-        bec_derivative=True,
-        publish_documents_with_kafka=True,
-        magics=not IS_QS_WORKER,
-        mpl=not IS_QS_WORKER,
-        redis_url="xf12id2-smi-redis1.nsls2.bnl.gov",
-        redis_port=6380,
-        redis_ssl=True,
-    )
+# Reads use the remote Tiled client below; writes use tiled_inserter and Kafka.
+# Do not construct the unused local Mongo broker: its adapter couples startup to
+# server-side Tiled APIs. Explicitly name the Kafka beamline without broker_name.
+nslsii.configure_base(
+    _user_ns,
+    broker_name=None,
+    bec_derivative=True,
+    publish_documents_with_kafka="smi",
+    magics=not IS_QS_WORKER,
+    mpl=not IS_QS_WORKER,
+    redis_url="xf12id2-smi-redis1.nsls2.bnl.gov",
+    redis_port=6380,
+    redis_ssl=True,
+)
 
 RE = _user_ns["RE"]
 bec = _user_ns["bec"]
 sd = _user_ns["sd"]
-RE.unsubscribe(0)
 RE.subscribe(tiled_inserter.insert)
 
 from smi_beamline.devices import _context as _seam

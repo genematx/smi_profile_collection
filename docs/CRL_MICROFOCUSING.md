@@ -145,6 +145,21 @@ as the CRLs move.
 
 ## Usage with the existing CRL object
 
+For experimentally verified focus positions, save a full
+[beam-position snapshot](BEAM_POSITION_SNAPSHOTS.md#recording-a-good-crl-focus):
+
+```python
+save_beam_position_snapshot(
+    "good_focus_16p1keV_2026_10_15_1430",
+    crl_inserted=[3],
+    note="Best focus at sample",
+)
+```
+
+This records measured CRL body and holder positions together with mirror positions,
+bimorph voltages, energy, SSA, and the other beam-alignment settings. The existing
+comparison and restore helpers operate on the complete saved alignment.
+
 Existing components remain `EpicsMotor`s with their original PV suffixes:
 `crl.lens1` … `crl.lens12`, `crl.x`, `crl.y`, `crl.z`, `crl.ph`, `crl.th`.
 The added methods are **calculations only**, using explicit **keV** inputs:

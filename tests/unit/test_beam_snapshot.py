@@ -1,4 +1,5 @@
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +52,17 @@ def _xbpm(prefix, start=0):
     return dev
 
 
+def _crl():
+    dev = _Device()
+    dev.inserted_tolerance_mm = 3.0
+    for axis in ("x", "y", "z", "ph", "th"):
+        setattr(dev, axis, _Motor("crl_" + axis, 0.0))
+    for i in range(1, 13):
+        value = -0.42 if i == 3 else (10.0 if i <= 6 else -10.0)
+        setattr(dev, "lens{}".format(i), _Motor("crl_lens{}".format(i), value))
+    return dev
+
+
 def _voltage(prefix):
     dev = _Device()
     dev.name = prefix
@@ -100,6 +112,7 @@ def _namespace():
     xbpm3.range = Signal(name="xbpm3_range", value=3)
     return {
         "mdsave": {},
+        "crl": _crl(),
         "wbs": _slit("wbs"),
         "ssa": _slit("ssa"),
         "eslit": _slit("eslit"),
@@ -124,9 +137,9 @@ def test_beam_snapshot_saves_to_mdsave_and_indexes():
         "test", note="unit", namespace=ns, store=ns["mdsave"])
 
     assert snapshot["snapshot_name"] == "test"
-    assert len(snapshot["items"]) == 68
+    assert len(snapshot["items"]) == 85
     assert "beam_position_snapshots:test" in ns["mdsave"]
-    assert ns["mdsave"]["beam_position_snapshots:index"]["test"]["count"] == 68
+    assert ns["mdsave"]["beam_position_snapshots:index"]["test"]["count"] == 85
 
     names = {item["name"] for item in snapshot["items"]}
     assert "energy.bragg" in names
@@ -304,6 +317,8 @@ def test_restore_starts_each_motor_batch_before_waiting_and_keeps_read_only_axes
         {dev + "_" + axis for dev in ("hfm", "vfm", "vdm") for axis in ("x", "y")},
         {dev + "_th" for dev in ("hfm", "vfm", "vdm")},
         {dev + "_" + axis for dev in ("xbpm2", "xbpm3") for axis in ("x", "y")},
+        {"crl_" + axis for axis in ("x", "y", "z", "ph", "th")},
+        {"crl_lens{}".format(i) for i in range(1, 13)},
     ]
     rows = {row["name"]: row for row in result.plan_result}
     for item in snapshot["items"]:
@@ -377,3 +392,101 @@ def test_energy_restore_records_harmonic_with_feedback_off_before_gain():
     assert en.pitch_feedback_disabled.get() == "1"
     assert en.roll_feedback_disabled.get() == "1"
     assert ns["ph_shutter"].get() == "Close"
+
+
+def test_crl_alignment_is_part_of_full_persisted_beam_snapshot():
+    ns = _namespace()
+    # An explicitly aligned holder can lie outside the automatic IN tolerance.
+    ns["crl"].lens3.user_readback.put(-3.2)
+    snapshot = beam_snapshot.save_beam_position_snapshot(
+        "good_focus_16keV", crl_inserted=[3], note="best focus", namespace=ns)
+    saved = json.loads(json.dumps(ns["mdsave"]["beam_position_snapshots:good_focus_16keV"]))
+    assert saved == snapshot
+    assert saved["created"] and saved["operator"]
+    assert saved["schema_version"] == 3
+    items = {item["name"]: item for item in saved["items"]}
+    assert {"crl." + axis for axis in ("x", "y", "z", "ph", "th")} <= items.keys()
+    assert {"crl.lens{}".format(i) for i in range(1, 13)} <= items.keys()
+    assert {"hfm.x", "vfm.th", "vdm.y", "hfm_voltage.ch15", "vfm_voltage.ch15",
+            "ssa.h", "ssa.v", "ssa.hg", "ssa.vg", "energy.energy"} <= items.keys()
+    alignment = saved["crl_alignment"]
+    assert alignment["state_source"] == "operator"
+    assert alignment["declared_inserted"] == [3]
+    assert alignment["holders"][2] == {"number": 3, "state": "IN", "in_mm": -3.2}
+    assert all(h["state"] == "OUT" and h["in_mm"] is None
+               for h in alignment["holders"] if h["number"] != 3)
+    registry = {item["name"]: item for item in beam_snapshot.beam_snapshot_devices(ns)}
+    assert registry["crl.lens3"]["restore"] is True
+
+
+@pytest.mark.parametrize("inserted, source, state", [
+    (None, "readback_zero_tolerance", "IN"), ([], "operator", "OUT"),
+])
+def test_crl_state_inference_and_explicit_all_out(inserted, source, state):
+    ns = _namespace()
+    snapshot = beam_snapshot.save_beam_position_snapshot(namespace=ns, crl_inserted=inserted)
+    alignment = snapshot["crl_alignment"]
+    assert alignment["state_source"] == source
+    assert alignment["holders"][2]["state"] == state
+    assert alignment["holders"][2]["in_mm"] == (-0.42 if state == "IN" else None)
+
+
+@pytest.mark.parametrize("inserted", [[0], [13], [3.0], [True], ["3"]])
+def test_crl_invalid_holder_numbers_do_not_save(inserted):
+    ns = _namespace()
+    with pytest.raises(ValueError, match="holder numbers"):
+        beam_snapshot.save_beam_position_snapshot(namespace=ns, crl_inserted=inserted)
+    assert ns["mdsave"] == {}
+
+
+def test_crl_failed_readback_is_unknown_and_not_a_restore_target():
+    ns = _namespace()
+    def fail():
+        raise TimeoutError("disconnected")
+    ns["crl"].lens3.user_readback.get = fail
+    snapshot = beam_snapshot.save_beam_position_snapshot(namespace=ns, crl_inserted=[3])
+    assert snapshot["crl_alignment"]["holders"][2] == {
+        "number": 3, "state": "UNKNOWN", "in_mm": None}
+    assert snapshot["crl_alignment"]["declared_inserted"] == [3]
+    rows = beam_snapshot.restore_beam_position_snapshot(
+        snapshot, namespace=ns, names=["crl.lens3"], print_table=False)
+    assert rows[0]["status"] == "skipped non-numeric target"
+
+
+def test_crl_compare_and_filtered_restore_use_measured_in_and_out_positions():
+    ns = _namespace()
+    snapshot = beam_snapshot.save_beam_position_snapshot(namespace=ns, crl_inserted=[3])
+    for axis in ("x", "lens3", "lens7", "lens8"):
+        getattr(ns["crl"], axis).user_readback.put(5.0)
+        getattr(ns["crl"], axis).user_setpoint.put(5.0)
+    ns["hfm"].x.user_readback.put(50.0)
+    compared = beam_snapshot.compare_beam_position_snapshot(snapshot, namespace=ns, print_table=False)
+    assert next(row for row in compared if row["name"] == "crl.lens3")["snapshot"] == -0.42
+    options = dict(namespace=ns, groups=["crl"], exclude=["crl.lens8"], print_table=False)
+    preview = beam_snapshot.restore_beam_position_snapshot(snapshot, **options)
+    assert ns["crl"].lens3.user_setpoint.get() == 5.0
+    assert ns["ph_shutter"].get() == "Open"
+    assert {row["name"] for row in preview if row["status"] == "would move"} == {
+        "crl.x", "crl.lens3", "crl.lens7"}
+    engine = RunEngine({})
+    engine(beam_snapshot.restore_beam_position_snapshot(snapshot, dry_run=False, **options))
+    assert ns["crl"].x.user_setpoint.get() == 0.0
+    assert ns["crl"].lens3.user_setpoint.get() == -0.42
+    assert ns["crl"].lens7.user_setpoint.get() == -10.0
+    assert ns["crl"].lens8.user_setpoint.get() == 5.0
+
+
+def test_legacy_snapshot_does_not_generate_crl_moves():
+    ns = _namespace()
+    snapshot = beam_snapshot.save_beam_position_snapshot(namespace=ns)
+    snapshot["schema_version"] = 2
+    snapshot.pop("crl_alignment")
+    snapshot["items"] = [item for item in snapshot["items"] if item["group"] != "crl"]
+    rows = beam_snapshot.compare_beam_position_snapshot(snapshot, namespace=ns, print_table=False)
+    assert all(row["status"] == "missing saved" for row in rows if row["group"] == "crl")
+    engine = RunEngine({})
+    messages = []
+    engine.msg_hook = messages.append
+    engine(beam_snapshot.restore_beam_position_snapshot(
+        snapshot, namespace=ns, dry_run=False, print_table=False))
+    assert not any(msg.command == "set" for msg in messages)

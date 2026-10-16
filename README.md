@@ -32,3 +32,7 @@ future starts. The environment-variable setting above lasts only for the launche
 ## Plan writing
 
 - [Energy scans with a single harmonic](docs/ENERGY_SCAN_HARMONICS.md)
+
+## Detector readout
+
+- [Pilatus corrected totals and stats hint selection](docs/PILATUS_CORRECTED_TOTALS_AND_HINTS.md)

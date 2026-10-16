@@ -475,11 +475,13 @@ class AttenuatorSet(Device):
                 labels.append("{}_{}".format(pfx, name[1:]))
         return tuple(sorted(labels, key=_ad._foil_sort_key))
 
-    def read_state(self, *, energy_eV=None, read_signal=None):
+    def read_state(self, *, energy_eV=None, read_signal=None, strict=False):
         """Read current foils and calculate attenuation without updating signals/RE.md.
 
         ``read_signal(signal)`` may supply bounded/cached reads for console displays.
         Unknown foil states raise rather than being silently treated as retracted.
+        With ``strict=True`` (acquisition corrections), require live/explicit energy
+        within the tables and finite, uncapped attenuation. Never use fallback energy.
         """
         read = read_signal if read_signal is not None else lambda signal: signal.get()
         labels = []
@@ -495,13 +497,25 @@ class AttenuatorSet(Device):
             elif value != foil.close_val:
                 raise ValueError(f"Unknown state for foil {label}: {value!r}")
         labels = tuple(sorted(labels, key=_ad._foil_sort_key))
-        energy = self._current_energy(energy_eV)
+        if strict:
+            energy = _context.current_energy_eV() if energy_eV is None else float(energy_eV)
+            if energy is None:
+                raise ValueError("Live attenuation energy is unavailable")
+            if not (_math_isfinite(energy) and energy > 0
+                    and _ad.ENERGY_MIN_EV <= energy <= _ad.ENERGY_MAX_EV):
+                raise ValueError(f"Attenuation energy outside the tabulated range: {energy!r}")
+        else:
+            energy = self._current_energy(energy_eV)
         factor = _ad.attenuation_factor(labels, energy)
         trans = _ad.transmission(labels, energy)
+        if strict and not (_math_isfinite(factor) and factor >= 1
+                           and _math_isfinite(trans) and 0 < trans <= 1
+                           and _math.isclose(factor * trans, 1.0, rel_tol=1e-12)):
+            raise ValueError("Attenuation factor/transmission is not finite and physically valid")
         return {
             "inserted": list(labels), "energy_eV": energy,
             "attenuation_factor": factor if _math_isfinite(factor) else _ad_MAX_FACTOR,
-            "transmission": max(trans, 1.0 / _ad_MAX_FACTOR),
+            "transmission": trans if strict else max(trans, 1.0 / _ad_MAX_FACTOR),
             "description": self._describe(labels),
         }
 

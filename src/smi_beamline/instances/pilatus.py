@@ -1,7 +1,12 @@
 
 import warnings
 from time import ctime
-from smi_beamline.devices.pilatus import SAXSPositions, FakeDetector, SAXS_Detector, WAXS_Detector, set_energy_cam
+from smi_beamline.devices.pilatus import (
+    SAXSPositions, FakeDetector, SAXS_Detector, WAXS_Detector, set_energy_cam,
+    hint_pilatus_stats,
+)
+from functools import partial as _partial
+from smi_beamline.instances.attenuators import attenuation
 from smi_beamline.instances.waxschamber import chamber_pressure
 from smi_beamline.instances.shutter import shopen, shclose
 from smi_beamline.instances.amptek import amptek
@@ -99,24 +104,15 @@ amptek_det = None
 #####################################################
 # Pilatus 900KW definition
 
-pil900KW = WAXS_Detector("XF:12IDC-ES:2{Det:900KW}", name="pil900KW", asset_path="pilatus900kw-1")
-pil900KW.set_primary_roi(1)
+pil900KW = WAXS_Detector("XF:12IDC-ES:2{Det:900KW}", name="pil900KW", asset_path="pilatus900kw-1",
+                        attenuation_provider=_partial(attenuation.read_state, strict=True))
+pil900KW.hint_stats(1)
 
 pil900kwroi1 = EpicsSignal("XF:12IDC-ES:2{Det:900KW}Stats1:Total_RBV", name="pil900kwroi1")
 pil900kwroi2 = EpicsSignal("XF:12IDC-ES:2{Det:900KW}Stats2:Total_RBV", name="pil900kwroi2")
 pil900kwroi3 = EpicsSignal("XF:12IDC-ES:2{Det:900KW}Stats3:Total_RBV", name="pil900kwroi3")
 pil900kwroi4 = EpicsSignal("XF:12IDC-ES:2{Det:900KW}Stats4:Total_RBV", name="pil900kwroi4")
 
-pil900KW.stats1.kind = "hinted"
-pil900KW.stats1.total.kind = "hinted"
-# set_primary_roi(1) above reset read_attrs to just [stats1, tiff], which forces stats2..5 to
-# kind='omitted' (so they drop out of read()/describe()).  Restore them as 'normal' (recorded but
-# not plotted) by setting kind -- which is the authoritative knob; assigning read_attrs would
-# clobber it again.  Set both the plugin and its .total signal so the *_stats{n}_total fields are
-# emitted in every event.
-for _n in (2, 3, 4, 5):
-    getattr(pil900KW, f"stats{_n}").kind = "normal"
-    getattr(pil900KW, f"stats{_n}").total.kind = "normal"
 pil900KW.cam.num_images.kind = "config"
 pil900KW.cam.kind = 'normal'
 pil900KW.cam.file_number.kind = 'normal'
@@ -138,8 +134,9 @@ pil900KW.motors.bs_y.user_readback.kind = 'normal'
 #####################################################
 # Pilatus 1M definition  
 #pil1M = Pilatus("XF:12IDC-ES:2{Det:1M}", name="pil1M", asset_path="pilatus1m-1")  # , detector_id="SAXS")
-pil2M = SAXS_Detector("XF:12ID2-ES{Pilatus:Det-2M}", name="pil2M", asset_path="pilatus2m-1")  # , detector_id="SAXS")
-pil2M.set_primary_roi(1)
+pil2M = SAXS_Detector("XF:12ID2-ES{Pilatus:Det-2M}", name="pil2M", asset_path="pilatus2m-1",
+                     attenuation_provider=_partial(attenuation.read_state, strict=True))
+pil2M.hint_stats(1)
 
 pil2m_pos = pil2M.motor
 # Capitalized alias: smi_plans' _qserver DEVICE_REGISTRY / SDD specs reference this as ``pil2M_pos``
@@ -155,16 +152,6 @@ pil2mroi2 = EpicsSignal("XF:12ID2-ES{Pilatus:Det-2M}Stats2:Total_RBV", name="pil
 pil2mroi3 = EpicsSignal("XF:12ID2-ES{Pilatus:Det-2M}Stats3:Total_RBV", name="pil2mroi3")
 pil2mroi4 = EpicsSignal("XF:12ID2-ES{Pilatus:Det-2M}Stats4:Total_RBV", name="pil2mroi4")
 
-pil2M.stats1.kind = "hinted"
-pil2M.stats1.total.kind = "hinted"
-# set_primary_roi(1) above reset read_attrs to just [stats1, tiff], which forces stats2..5 to
-# kind='omitted' (so they drop out of read()/describe()).  Restore them as 'normal' (recorded but
-# not plotted) by setting kind -- which is the authoritative knob; assigning read_attrs would
-# clobber it again.  Set both the plugin and its .total signal so the *_stats{n}_total fields are
-# emitted in every event.
-for _n in (2, 3, 4, 5):
-    getattr(pil2M, f"stats{_n}").kind = "normal"
-    getattr(pil2M, f"stats{_n}").total.kind = "normal"
 pil2M.cam.num_images.kind = "config"
 pil2M.cam.kind = 'config'
 pil2M.cam.file_number.kind = 'config'
@@ -309,5 +296,4 @@ def vent_waxs():
     yield from no_re_busy_lock()
     print(f'starting chamber venting - this can take 5-10 minutes')
     yield from chamber_pressure.vent()
-
 

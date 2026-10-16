@@ -13,7 +13,14 @@ from ophyd import (
     TIFFPlugin,
     Staged,
     DeviceStatus,
+    Kind,
 )
+from ophyd.signal import SignalRO
+from collections import OrderedDict
+from collections.abc import Mapping
+from numbers import Integral, Real
+from threading import RLock
+import math
 
 from ophyd.areadetector.cam import PilatusDetectorCam
 from ophyd.areadetector.detectors import PilatusDetector
@@ -34,6 +41,7 @@ from warnings import warn
 from .beamstop import SAXSBeamStops
 from . import _context
 from . import _config
+from . import attenuator_data as _attenuator_data
 from .status import WAXS_STATUS, SAXS_STATUS, compare_energy, finite_number, read_signal as _read_signal
 
 # Persistent-config dict (Redis ``mdsave`` on the live beamline; ``{}`` fallback under bare
@@ -42,8 +50,54 @@ from .status import WAXS_STATUS, SAXS_STATUS, compare_energy, finite_number, rea
 mdsave = _context.get_config()
 
 
+class _SnapshotSignal(SignalRO):
+    """Read-only leaf of the last successful parent detector read (no monitors)."""
+
+    def __init__(self, *args, snapshot_dtype="number", **kwargs):
+        self._snapshot_dtype = snapshot_dtype
+        super().__init__(*args, **kwargs)
+
+    def _reading(self):
+        owner = self.parent
+        while owner is not None and not hasattr(owner, "_correction_snapshot"):
+            owner = owner.parent
+        snapshot = None if owner is None else owner._correction_snapshot
+        if snapshot is None or self not in snapshot:
+            raise RuntimeError(f"{self.name}: unavailable until a successful parent detector read")
+        return snapshot[self]
+
+    def get(self, **kwargs):
+        return self._reading()["value"]
+
+    @property
+    def timestamp(self):
+        return self._reading()["timestamp"]
+
+    def read(self):
+        # Capture the value and timestamp from the same snapshot, even if another
+        # thread publishes a new one between accesses.
+        return {self.name: dict(self._reading())}
+
+    def describe(self):
+        return {self.name: {"source": f"computed:{self.name}",
+                           "dtype": self._snapshot_dtype, "shape": []}}
+
+
 class StatsWCentroid(StatsPluginV33):
     centroid_total = Cpt(EpicsSignalRO,'CentroidTotal_RBV')
+    total_corrected = Cpt(_SnapshotSignal, kind="normal")
+
+    def _read_without_correction(self):
+        result = OrderedDict()
+        for _, component in self._get_components_of_kind(Kind.normal):
+            if not isinstance(component, _SnapshotSignal):
+                result.update(component.read())
+        return result
+
+
+def hint_pilatus_stats(detector, stats, *, corrected=False):
+    """Select stats display hints between runs, retaining all raw/corrected totals."""
+    return detector.hint_stats(stats, corrected=corrected)
 
 
 class PilatusDetectorCamV33(PilatusDetectorCam):
@@ -112,6 +166,9 @@ class TIFFPluginWithFileStore(TIFFPlugin, FileStoreTIFFIterativeWrite):
     def describe(self):
         ret = super().describe()
         key = self.parent._image_name
+        if key not in ret:
+            # Before the first datum, filestore has no image field to describe.
+            return ret
         color_mode = self.parent.cam.color_mode.get(as_string=True)
         if color_mode == 'Mono':
             ret[key]['shape'] = [
@@ -170,21 +227,36 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
         root="/nsls2/data/smi/proposals",
     )
 
-    def __init__(self, *args, asset_path, **kwargs):
+    attenuation_factor_used = Cpt(_SnapshotSignal, kind="normal")
+    attenuation_energy_eV_used = Cpt(_SnapshotSignal, kind="normal")
+    attenuation_foils_used = Cpt(_SnapshotSignal, snapshot_dtype="string", kind="normal")
+
+    def __init__(self, *args, asset_path, attenuation_provider=None, **kwargs):
         self.asset_path = asset_path
+        self.attenuation_provider = attenuation_provider
+        self._correction_snapshot = None
+        self._snapshot_lock = RLock()
+        self._snapshot_reading = False
+        # Establish the minimal parent readout once, not on every hint selection.
+        # Instance setup adds the existing SAXS/WAXS motor/camera readouts.
+        kwargs.setdefault("read_attrs", [
+            "stats1", "stats2", "stats3", "stats4", "stats5", "tiff",
+            "attenuation_factor_used", "attenuation_energy_eV_used", "attenuation_foils_used",
+        ])
         super().__init__(*args, **kwargs)
         self.tiff._asset_path = self.asset_path
+        self.hint_stats(1)
 
     roi1 = Cpt(ROIPlugin, "ROI1:")
     roi2 = Cpt(ROIPlugin, "ROI2:")
     roi3 = Cpt(ROIPlugin, "ROI3:")
     roi4 = Cpt(ROIPlugin, "ROI4:")
 
-    stats1 = Cpt(StatsWCentroid, "Stats1:", read_attrs=["total"])
-    stats2 = Cpt(StatsWCentroid, "Stats2:", read_attrs=["total"])
-    stats3 = Cpt(StatsWCentroid, "Stats3:", read_attrs=["total"])
-    stats4 = Cpt(StatsWCentroid, "Stats4:", read_attrs=["total"])
-    stats5 = Cpt(StatsWCentroid, "Stats5:", read_attrs=["total"])
+    stats1 = Cpt(StatsWCentroid, "Stats1:", read_attrs=["total", "total_corrected"])
+    stats2 = Cpt(StatsWCentroid, "Stats2:", read_attrs=["total", "total_corrected"])
+    stats3 = Cpt(StatsWCentroid, "Stats3:", read_attrs=["total", "total_corrected"])
+    stats4 = Cpt(StatsWCentroid, "Stats4:", read_attrs=["total", "total_corrected"])
+    stats5 = Cpt(StatsWCentroid, "Stats5:", read_attrs=["total", "total_corrected"])
 
     over1 = Cpt(OverlayPlugin, "Over1:")
     trans1 = Cpt(TransformPlugin, "Trans1:")
@@ -200,9 +272,123 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
     apply_read = Cpt(EpicsSignal, "cam1:ThresholdApply_RBV")
 
     def set_primary_roi(self, num):
-        st = f"stats{num}"
-        self.read_attrs = [st, "tiff"]
-        getattr(self, st).kind = "hinted"
+        """Old spelling for raw stats hints; no longer narrows the recorded readout."""
+        if isinstance(num, bool) or not isinstance(num, Integral):
+            raise ValueError("stats index must be an integer in 1–5")
+        return self.hint_stats(num, corrected=False)
+
+    def hint_stats(self, stats, *, corrected=False):
+        """Replace stats-total hints, preserving all totals and unrelated readouts.
+
+        Call between runs. ``stats`` is an integer or iterable of integers in 1–5;
+        an empty iterable clears stats hints. Selection lasts for this session.
+        """
+        if not isinstance(corrected, bool):
+            raise ValueError("corrected must be a boolean")
+        if isinstance(stats, Integral):
+            stats = [stats]
+        try:
+            selection = list(stats)
+        except TypeError as exc:
+            raise ValueError("stats must be an integer or iterable of integers in 1–5") from exc
+        if any(isinstance(n, bool) or not isinstance(n, Integral) or not 1 <= n <= 5
+               for n in selection):
+            raise ValueError("stats indices must be integers in 1–5 (not booleans)")
+        selection = sorted(set(int(n) for n in selection))
+        hint_bit = Kind.hinted & ~Kind.normal
+        for n in range(1, 6):
+            plugin = getattr(self, f"stats{n}")
+            plugin.kind |= Kind.normal
+            for leaf, mode in ((plugin.total, False), (plugin.total_corrected, True)):
+                leaf.kind = (leaf.kind & ~hint_bit) | Kind.normal
+                if n in selection and mode == corrected:
+                    leaf.kind |= Kind.hinted
+        return {"stats": selection, "corrected": corrected,
+                "fields": list(self.hints["fields"])}
+
+    @staticmethod
+    def _finite_scalar(value, label):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+            raise ValueError(f"{label} must be a finite numeric scalar, got {value!r}")
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"{label} must be finite, got {value!r}")
+        return value
+
+    def _attenuation_state(self):
+        if not callable(self.attenuation_provider):
+            raise RuntimeError(f"{self.name}: no attenuation provider configured")
+        state = self.attenuation_provider()
+        timestamp = ttime.time()
+        if not isinstance(state, Mapping):
+            raise ValueError("attenuation provider must return a state mapping")
+        try:
+            factor = self._finite_scalar(state["attenuation_factor"], "attenuation factor")
+            transmission = self._finite_scalar(state["transmission"], "transmission")
+            energy = self._finite_scalar(state["energy_eV"], "attenuation energy")
+            labels = state["inserted"]
+            if isinstance(labels, (str, bytes)):
+                raise ValueError("inserted foils must be a sequence of labels")
+            labels = list(labels)
+        except (KeyError, TypeError) as exc:
+            raise ValueError("incomplete or invalid attenuation state") from exc
+        if not (factor >= 1 and 0 < transmission <= 1
+                and math.isclose(factor * transmission, 1.0, rel_tol=1e-12)):
+            raise ValueError("invalid attenuation factor/transmission")
+        if not (energy > 0 and _attenuator_data.ENERGY_MIN_EV <= energy
+                <= _attenuator_data.ENERGY_MAX_EV):
+            raise ValueError("attenuation energy outside the tabulated range")
+        if any(not isinstance(label, str) or label not in _attenuator_data.FOIL_LAYOUT
+               for label in labels) or len(set(labels)) != len(labels):
+            raise ValueError("invalid or duplicate inserted foil labels")
+        labels.sort(key=_attenuator_data._foil_sort_key)
+        return factor, energy, ",".join(labels), timestamp
+
+    def read(self):
+        """Read raw data once, then publish one validated attenuation snapshot.
+
+        Energy/foils must remain settled from exposure through all detector reads.
+        Child corrected/provenance reads expose only the last successful snapshot.
+        """
+        with self._snapshot_lock:
+            if self._snapshot_reading:
+                raise RuntimeError(f"{self.name}: recursive detector read")
+            self._snapshot_reading = True
+            try:
+                result = OrderedDict()
+                for _, component in self._get_components_of_kind(Kind.normal):
+                    if isinstance(component, _SnapshotSignal):
+                        continue
+                    if isinstance(component, StatsWCentroid):
+                        result.update(component._read_without_correction())
+                    else:
+                        result.update(component.read())
+                totals = []
+                for n in range(1, 6):
+                    plugin = getattr(self, f"stats{n}")
+                    if plugin.total.name not in result:
+                        raise RuntimeError(f"Missing required raw total: {plugin.total.name}")
+                    raw = result[plugin.total.name]
+                    value = self._finite_scalar(raw["value"], plugin.total.name)
+                    totals.append((plugin.total_corrected, value, raw["timestamp"]))
+                factor, energy, foils, timestamp = self._attenuation_state()
+                snapshot = {}
+                for signal, value, raw_time in totals:
+                    product = self._finite_scalar(value * factor, signal.name)
+                    snapshot[signal] = {"value": product, "timestamp": raw_time}
+                for signal, value in ((self.attenuation_factor_used, factor),
+                                      (self.attenuation_energy_eV_used, energy),
+                                      (self.attenuation_foils_used, foils)):
+                    snapshot[signal] = {"value": value, "timestamp": timestamp}
+                # Respect manual leaf omission in read/describe alike; the helper
+                # restores both totals. Required raw totals may never be omitted.
+                for signal, reading in snapshot.items():
+                    if signal.kind & Kind.normal:
+                        result[signal.name] = dict(reading)
+                self._correction_snapshot = snapshot
+                return result
+            finally:
+                self._snapshot_reading = False
 
     # This is breaking some of the scans trying to reset trshold and gain
 

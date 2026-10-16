@@ -102,6 +102,76 @@ def test_read_state_rejects_unknown_foil_state(attset):
         att.read_state(energy_eV=16150)
 
 
+def test_strict_state_requires_live_energy_but_default_retains_fallback(attset):
+    att, _, _ = attset
+    att.energy_eV.put(12000)
+    _context._energy_source = None
+    with pytest.raises(ValueError, match="energy is unavailable"):
+        att.read_state(strict=True)
+    assert att.read_state()["energy_eV"] == 12000
+    assert att.read_state(strict=True, energy_eV=10000)["energy_eV"] == 10000
+
+    def disconnected():
+        raise TimeoutError("disconnected")
+
+    _context.configure(energy_source=disconnected)
+    with pytest.raises(ValueError, match="energy is unavailable"):
+        att.read_state(strict=True)
+
+
+@pytest.mark.parametrize("energy", [0, -1, 1, 1e8, float("nan"), float("inf")])
+def test_strict_state_rejects_out_of_range_energy(attset, energy):
+    att, _, _ = attset
+    with pytest.raises(ValueError, match="tabulated range"):
+        att.read_state(strict=True, energy_eV=energy)
+
+
+def test_strict_state_does_not_floor_transmission_or_cap_factor(attset, monkeypatch):
+    from smi_beamline.devices import attenuator_data as ad
+    from smi_beamline.devices.attenuators import _ad_MAX_FACTOR
+
+    att, _, _ = attset
+    monkeypatch.setattr(ad, "transmission", lambda *args: 1e-305)
+    result = att.read_state(strict=True)
+    assert result["transmission"] == 1e-305
+    assert result["attenuation_factor"] > _ad_MAX_FACTOR
+    monkeypatch.setattr(ad, "transmission", lambda *args: 0.0)
+    with pytest.raises(ValueError, match="factor/transmission"):
+        att.read_state(strict=True)
+    assert att.read_state()["attenuation_factor"] == _ad_MAX_FACTOR
+    assert att.read_state()["transmission"] == 1 / _ad_MAX_FACTOR
+
+
+def test_strict_state_rejects_real_table_underflow_and_bad_foils(attset, monkeypatch):
+    from smi_beamline.devices import attenuator_data as ad
+
+    att, b1, b2 = attset
+    for bank in (b1, b2):
+        for name in bank.component_names:
+            getattr(bank, name).status.sim_put("Open")
+    with pytest.raises(ValueError, match="factor/transmission"):
+        att.read_state(strict=True, energy_eV=ad.ENERGY_MIN_EV)
+    b1.f1.status.sim_put("Moving")
+    with pytest.raises(ValueError, match="Unknown state"):
+        att.read_state(strict=True)
+    monkeypatch.setattr(b1.f1.status, "get", lambda: (_ for _ in ()).throw(TimeoutError()))
+    with pytest.raises(TimeoutError):
+        att.read_state(strict=True)
+
+
+def test_strict_state_is_side_effect_free_and_accepts_endpoints(attset, monkeypatch):
+    from smi_beamline.devices import attenuator_data as ad
+
+    att, _, _ = attset
+    monkeypatch.setattr(att, "_update_run_md", lambda *a: pytest.fail("metadata changed"))
+    for signal in (att.energy_eV, att.attenuation_factor, att.transmission, att.description, att.inserted):
+        monkeypatch.setattr(signal, "put", lambda *a: pytest.fail("signal changed"))
+    for energy in (ad.ENERGY_MIN_EV, ad.ENERGY_MAX_EV):
+        result = att.read_state(strict=True, energy_eV=energy)
+        assert result["energy_eV"] == energy
+        assert result["attenuation_factor"] == 1
+
+
 def test_reports_factor_and_description_for_inserted_foils(attset):
     att, b1, b2 = attset
     # manually insert a known foil (att2_1 == Mo 20um) and one Cu (att1_1)

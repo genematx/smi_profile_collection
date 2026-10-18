@@ -9,13 +9,13 @@ def clean(text):
     return "".join(char if char.isprintable() else " " for char in text)
 
 
-def render_card(identifier, *, detail=False, width=88, catalog=CATALOG):
+def render_card(identifier, *, detail=False, width=88, catalog=CATALOG, include_links=True):
     card = catalog[identifier]
     lines = [f"{card.title}  [{card.kind}; {card.review}]", card.summary]
     for heading, text in card.sections:
         lines.extend(("", heading + ":"))
         lines.extend("  " + line for line in text.splitlines())
-    if card.links:
+    if include_links and card.links:
         lines.extend(("", "Explore / related:"))
         for i, link in enumerate(card.links, 1):
             lines.append(f"  {i}. {link.label}  [{link.relation}]")

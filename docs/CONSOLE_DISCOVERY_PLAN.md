@@ -244,9 +244,24 @@ command reference and gains a single pointer to `%guide` after implementation.
 Calling `%guide` without arguments opens a temporary documentation prompt inside
 terminal IPython. Bare `guide` may work through normal IPython automagic when
 unshadowed; do not replace an existing Python name. Use `prompt_toolkit`, already
-used by terminal IPython, for a small searchable selection menu below ordinary
-printed cards. Verify compatibility with the installed version and declare the
+used by terminal IPython, for a searchable selection menu below the current
+scrollable card in a temporary alternate screen. Navigation replaces the screen
+instead of accumulating console output. Exit restores the original console and
+prints only the breadcrumb, last entry's title/summary and direct lookup command.
+Page Up/Down scrolls long cards. This supersedes the original inline/scrollback
+proposal following pilot feedback. The plain numbered fallback retains a text
+transcript for terminals without screen control. Verify compatibility with the installed version and declare the
 dependency explicitly if the implementation imports it directly.
+
+Further pilot feedback establishes one numbered choices list, rather than links
+printed on the card and duplicated in the selector. Number + Enter opens that
+entry; a search followed by a number (e.g. `exp 2`) selects a filtered result.
+Multi-digit numbers work and invalid numbers do not navigate. Colors replace
+bracketed relation labels: cyan topics, blue equipment/parts/parent, magenta
+related equipment, green command/workflow help, yellow scientist help, muted
+navigation. Include a compact legend and pointer/reverse selection. Honor
+`NO_COLOR` and IPython's no-color preference with textual relationship fallbacks.
+Direct one-shot lookups retain their plain-text links.
 
 ```text
 SMI GUIDE — browse and learn
@@ -383,7 +398,8 @@ or history are not needed for the initial prototype.
   `--all` must not reveal unpublished/staff-only internals as a hidden escape hatch.
 - Stable one-line forms work in logs and pasted transcripts. Interactive cards
   show their equivalent direct query. Numbered choices are a fallback, not the
-  primary interaction. Avoid a full-screen TUI in the first release.
+  primary interaction. Keep all rich navigation inside one temporary-screen
+  application so intermediate cards do not enter normal console scrollback.
 - Respect `NO_COLOR`, narrow terminals, and plain text. Sanitize terminal control
   sequences in catalog and external strings. Use words as well as color.
 

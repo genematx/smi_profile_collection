@@ -12,6 +12,7 @@ import pytest
 from IPython.core.interactiveshell import InteractiveShell
 from IPython.core.completer import CompletionContext
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 from traitlets.config import Config
 
@@ -196,8 +197,9 @@ def test_dumb_terminal_uses_numbered_fallback(shell, monkeypatch):
     monkeypatch.setattr(ipython, "terminal_available", lambda _: True)
     monkeypatch.setattr(browser, "browse", lambda **kwargs: calls.append(kwargs))
     monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setenv("NO_COLOR", "1")
     assert shell.run_cell("%guide").success
-    assert calls == [{"plain": True}]
+    assert calls == [{"plain": True, "color": False}]
 
 
 def test_plain_navigation_search_and_interrupt():
@@ -207,11 +209,11 @@ def test_plain_navigation_search_and_interrupt():
     transcript = "\n".join(output)
     assert "Direct lookup: %guide show pil2M.motor.z" in transcript
     assert "Direct lookup: %guide show runengine" in transcript
-    assert "Leaving guide" in transcript
+    assert "Guide closed" in transcript
     def interrupted(_):
         raise KeyboardInterrupt
     browse(plain=True, read=interrupted, write=output.append)
-    assert "Leaving guide" in output[-1]
+    assert "Reopen this entry: %guide show home" == output[-1]
 
 
 @pytest.mark.parametrize("keys,expected", [
@@ -222,6 +224,11 @@ def test_plain_navigation_search_and_interrupt():
     ("\x03", ":exit"),
     ("\x1b\x1b[D", ":back"),
     ("no-such-entry\r\x04", ":exit"),
+    ("1\r", "devices"),
+    ("2\r", "alignment"),
+    ("0\r\x04", ":exit"),
+    ("999\r\x04", ":exit"),
+    ("exp 1\r", "command:exp"),
 ])
 def test_real_prompt_key_handling(keys, expected):
     async def exercise():
@@ -232,35 +239,134 @@ def test_real_prompt_key_handling(keys, expected):
     assert asyncio.run(exercise()) == expected
 
 
-def test_actual_terminal_ipython_handoff(tmp_path):
+def test_browser_navigation_is_one_application_with_scrollable_cards():
+    async def exercise():
+        nav = Navigation()
+        with create_pipe_input() as pipe:
+            app = selector("home", navigation=nav, input=pipe, output=DummyOutput())
+            assert app.full_screen
+            pipe.send_text("pil2M\rcommand:exp\r\x1b[6~\x1b[5~\x1b\x1b[D\x04")
+            result = await asyncio.wait_for(app.run_async(), timeout=3)
+        assert nav.history == ["home", "pil2M"]
+        assert result == ":exit"
+    asyncio.run(exercise())
+
+
+def test_rich_browser_only_prints_final_summary(monkeypatch):
+    from smi_beamline.discovery import browser
+
+    class App:
+        def run(self, **kwargs):
+            nav.visit("pil2M")
+            nav.visit("command:exp")
+
+        input = DummyInput()
+
+    def factory(start, *, navigation, color):
+        nonlocal nav
+        nav = navigation
+        return App()
+
+    nav = None
+    monkeypatch.setattr(browser, "selector", factory)
+    output = []
+    browse(write=output.append)
+    assert len(output) == 3
+    assert output[0] == "Guide closed — home > pil2M > command:exp"
+    assert output[1].startswith("Set detector exposure settings:")
+    assert output[2] == "Reopen this entry: %guide show command:exp"
+
+
+def test_single_menu_and_relation_colors():
+    from smi_beamline.discovery.presentation import menu_row, role
+    from smi_beamline.discovery.search import Match
+
+    text = render_card("pil2M", include_links=False)
+    assert "Explore / related:" not in text
+    assert "1. Exposure" not in text
+    assert "Explore / related:" in render_card("pil2M")  # direct lookup retains useful links
+    child = Match("pil2M.motor", "Detector positioning", "child")
+    assert role(child, "pil2M") == "part"
+    colored = menu_row(child, 3, True, "pil2M")
+    assert "class:part reverse bold" in [style for style, _ in colored]
+    assert "4." in colored[0][1]
+    assert "[child]" not in "".join(text for _, text in colored)
+    assert "— part" in "".join(text for _, text in menu_row(child, 3, True, "pil2M", color=False))
+
+
+@pytest.mark.parametrize("context,keys,expected", [
+    ("pil2M", "10\r", "pin_diode"),
+    ("pil2M", "4\r", "roi"),
+])
+def test_detector_menu_number_selection(context, keys, expected):
+    async def exercise():
+        with create_pipe_input() as pipe:
+            app = selector(context, input=pipe, output=DummyOutput())
+            pipe.send_text(keys)
+            return await asyncio.wait_for(app.run_async(), timeout=3)
+    assert asyncio.run(exercise()) == expected
+
+
+def test_no_color_environment_disables_palette(monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    with create_pipe_input() as pipe:
+        app = selector("home", input=pipe, output=DummyOutput(), color=True)
+        assert app.style.style_rules == []
+
+
+def test_ipython_no_color_preference(shell, monkeypatch):
+    from smi_beamline.discovery import browser, ipython
+
+    calls = []
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.setattr(ipython, "terminal_available", lambda _: True)
+    monkeypatch.setattr(browser, "browse", lambda **kwargs: calls.append(kwargs))
+    shell.colors = "nocolor"
+    assert shell.run_cell("%guide").success
+    assert calls == [{"plain": False, "color": False}]
+
+
+@pytest.mark.parametrize("colored", [False, True])
+def test_actual_terminal_ipython_handoff(tmp_path, colored):
     import pexpect
 
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"),
                PROMPT_TOOLKIT_NO_CPR="1", NO_COLOR="1")
+    if colored:
+        env.pop("NO_COLOR")
     child = pexpect.spawn(sys.executable, [
-        "-m", "IPython", "--quick", "--no-banner", "--colors=NoColor",
+        "-m", "IPython", "--quick", "--no-banner", "--colors=" + ("Linux" if colored else "NoColor"),
         f"--profile-dir={tmp_path}", "--HistoryManager.hist_file=:memory:",
         "--TerminalInteractiveShell.confirm_exit=False",
     ], env=env, encoding="utf-8", timeout=15, dimensions=(40, 110))
     try:
-        child.expect(r"In \[1\]:")
+        child.expect(r"In \[(?:\x1b\[[0-9;]*m)*1(?:\x1b\[[0-9;]*m)*\]:")
         child.sendline("%load_ext smi_beamline.discovery.ipython")
-        child.expect(r"In \[2\]:")
+        child.expect(r"In \[(?:\x1b\[[0-9;]*m)*2(?:\x1b\[[0-9;]*m)*\]:")
         child.sendline("%guide")
+        child.expect("\x1b\\[\\?1049h")  # enter alternate screen, preserve console
         child.expect("guide \\[home\\]")
+        if colored:
+            assert "\x1b[0;" in child.before  # styled screen output
         child.send("pil2M\r")
-        child.expect("Direct lookup: %guide show pil2M")
-        child.expect("guide \\[pil2M\\]")
+        # The persistent renderer updates only changed cells, not whole headings.
+        child.expect("Records small-angle scattering images")
         # Resize while the guide owns the prompt, then return to normal Python.
         child.setwinsize(35, 85)
         child.sendcontrol("d")
-        child.expect("Leaving guide")
-        child.expect(r"In \[3\]:")
+        child.expect("\x1b\\[\\?1049l")  # restore original console before summary
+        child.expect("Guide closed")
+        child.expect(r"In \[(?:\x1b\[[0-9;]*m)*3(?:\x1b\[[0-9;]*m)*\]:")
+        summary = child.before
+        assert "home > pil2M" in summary
+        assert "Reopen this entry: %guide show pil2M" in summary
+        assert "Explore / related" not in summary
         child.sendline("print('GUIDE_RETURN_OK')")
         child.expect("GUIDE_RETURN_OK")
-        child.expect(r"In \[4\]:")
+        child.expect(r"In \[(?:\x1b\[[0-9;]*m)*4(?:\x1b\[[0-9;]*m)*\]:")
         child.sendline("%unload_ext smi_beamline.discovery.ipython")
-        child.expect(r"In \[5\]:")
+        child.expect(r"In \[(?:\x1b\[[0-9;]*m)*5(?:\x1b\[[0-9;]*m)*\]:")
         child.sendline("exit()")
         child.expect(pexpect.EOF)
     finally:

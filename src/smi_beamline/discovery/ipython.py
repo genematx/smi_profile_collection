@@ -48,7 +48,8 @@ def run_guide(shell, line):
     if not tokens or tokens == ["--plain"]:
         if terminal_available(shell):
             from .browser import browse
-            browse(plain=bool(tokens) or os.environ.get("TERM") == "dumb")
+            browse(plain=bool(tokens) or os.environ.get("TERM") == "dumb",
+                   color=str(shell.colors).lower() != "nocolor" and "NO_COLOR" not in os.environ)
         else:
             print(HELP)
             print(render_card("home"))

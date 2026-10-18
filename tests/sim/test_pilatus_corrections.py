@@ -97,6 +97,7 @@ def test_first_read_describe_readonly_and_timestamps(detector, monkeypatch):
 
 def test_exact_raw_once_and_no_child_recalculation(detector, monkeypatch):
     det = detector
+    det.add_roi_calculation("refl", lambda roi: roi[1] - 0.5 * (roi[4] - roi[1]))
     calls = Counter()
     for n in range(1, 6):
         signal = getattr(det, f"stats{n}").total
@@ -118,6 +119,10 @@ def test_exact_raw_once_and_no_child_recalculation(detector, monkeypatch):
         for n in range(1, 6):
             assert result[f"det_stats{n}_total_corrected"]["value"] == (
                 result[f"det_stats{n}_total"]["value"] * factor)
+        assert result["refl"]["value"] == (
+            result["det_stats1_total_corrected"]["value"] - 0.5 * (
+                result["det_stats4_total_corrected"]["value"] -
+                result["det_stats1_total_corrected"]["value"]))
     assert second[det.attenuation_foils_used.name]["value"] == "1_2,2_1,2_10"
 
 
@@ -311,6 +316,10 @@ def test_runengine_delayed_acquisition_preserves_tiff_assets_and_hints(make_fake
                         attenuation_provider=lambda: state(energy.get() / 5000, energy.get()))
         seed_detector(det)
         det.hint_stats([1, 3], corrected=True)
+        calculation_name = "refl" if name == "pil2M" else "waxs_refl"
+        det.add_roi_calculation(calculation_name, lambda roi: roi[1] - 0.5 * (roi[4] - roi[1]),
+                                description="ROI1 - 0.5 * (ROI4 - ROI1)")
+        det.hint_calculations(calculation_name)
         # IOC/file setup is simulated; real TIFF generate/read/describe/collect are used.
         def stage(det=det):
             det._staged = Staged.yes
@@ -374,8 +383,10 @@ def test_runengine_delayed_acquisition_preserves_tiff_assets_and_hints(make_fake
             for n in range(1, 6):
                 assert event["data"][f"{det.name}_stats{n}_total"] == 10 * frame + n
                 assert event["data"][f"{det.name}_stats{n}_total_corrected"] == factor * (10 * frame + n)
-            assert descriptor["hints"][det.name]["fields"] == [
-                det.stats1.total_corrected.name, det.stats3.total_corrected.name]
+            calculation_name = "refl" if det.name == "pil2M" else "waxs_refl"
+            assert descriptor["hints"][det.name]["fields"] == [calculation_name]
+            assert event["data"][calculation_name] == factor * (10 * frame - 0.5)
+            assert descriptor["data_keys"][calculation_name]["roi_input"] == "corrected"
             datum = datums[event["data"][det._image_name]]
             assert datum["resource"] in resources
             assert datum["datum_kwargs"]["point_number"] == frame - 1
@@ -388,6 +399,9 @@ def test_actual_instance_setup_and_namespace_export(monkeypatch):
     import ophyd
     import paramiko
     from smi_beamline.devices import pilatus
+    # Load classes before replacing ophyd.EpicsSignal below. Otherwise a first
+    # import during run_path permanently embeds fake components in this module.
+    from smi_beamline.devices.waxschamber import Sample_Chamber  # noqa: F401
     from smi_beamline.instances import _public_names
 
     _context.configure(energy_source=lambda: 10000)
@@ -430,3 +444,148 @@ def test_actual_instance_setup_and_namespace_export(monkeypatch):
         assert list(det.configuration_attrs) == configuration
         assert det.cam.wait_for_plugins in det.cam.stage_sigs or "wait_for_plugins" in det.cam.stage_sigs
     assert all(call.kwargs == {"strict": True} for call in provider.call_args_list)
+
+
+def test_named_calculations_use_selected_inputs_and_snapshot(detector):
+    det = detector
+    refl = det.add_roi_calculation("refl", lambda roi: roi[1] - 0.5 * (roi[4] - roi[1]),
+                                  description="ROI1 - 0.5 * (ROI4 - ROI1)")
+    ratio = det.add_roi_calculation("ratio", lambda roi: roi[2] / roi[5], corrected=False)
+    assert det.calculations["refl"] is refl
+    with pytest.raises(TypeError):
+        det.calculations["other"] = ratio
+    with pytest.raises(RuntimeError, match="unavailable"):
+        refl.get()
+    assert refl.name == "refl"
+    assert det.describe()["refl"] == {
+        "source": "computed:refl", "dtype": "number", "shape": [],
+        "roi_input": "corrected", "calculation_description": "ROI1 - 0.5 * (ROI4 - ROI1)",
+    }
+    assert det.attenuation_provider.call_count == 0
+    for method in (refl.put, refl.set):
+        with pytest.raises(ReadOnlyError):
+            method(1)
+    data = det.read()
+    assert data["refl"] == {"value": -1, "timestamp": 1005}
+    assert data["ratio"]["value"] == 0.4
+    assert set(data) == set(det.describe())
+    det.attenuation_provider.return_value = state(10)
+    assert refl.get() == -1
+    assert det.attenuation_provider.call_count == 1
+    data = det.read()
+    assert data["refl"]["value"] == -5
+    assert data["ratio"]["value"] == 0.4
+    data["refl"]["value"] = 999
+    assert refl.get() == -5  # returned events cannot mutate the private snapshot
+
+
+def test_calculation_hints_preserve_recording_and_unrelated_hints(detector):
+    det = detector
+    det.add_roi_calculation("refl", lambda roi: roi[1])
+    det.add_roi_calculation("background", lambda roi: roi[4] - roi[1])
+    det.threshold.kind = "hinted"
+    keys = set(det.read())
+    assert det.hint_calculations("refl")["fields"] == [det.threshold.name, "refl"]
+    assert set(det.read()) == keys
+    det.hint_stats([1, 2, 3], corrected=True)
+    assert "refl" in det.hints["fields"]  # hint_stats preserves calculation hints
+    det.hint_calculations(["background"], clear_stats=False)
+    assert set(det.hints["fields"]) == {
+        det.threshold.name, "background", *(f"det_stats{n}_total_corrected" for n in (1, 2, 3))}
+    det.hint_calculations([])
+    assert det.hints["fields"] == [det.threshold.name]
+    assert set(det.read()) == keys
+    for names in (["refl", "missing"], None, [False]):
+        with pytest.raises(ValueError):
+            det.hint_calculations(names)
+        assert det.hints["fields"] == [det.threshold.name]
+    with pytest.raises(ValueError):
+        det.hint_calculations("refl", clear_stats=1)
+
+
+@pytest.mark.parametrize("function", [
+    lambda roi: 1 / 0, lambda roi: float("nan"), lambda roi: float("inf"),
+    lambda roi: [roi[1]], lambda roi: True, lambda roi: roi[6],
+])
+def test_failed_calculation_does_not_publish_partial_snapshot(detector, function):
+    det = detector
+    refl = det.add_roi_calculation("refl", lambda roi: roi[1])
+    previous = det.read()
+    det.add_roi_calculation("bad", function)
+    det.stats1.total.sim_put(500)
+    with pytest.raises(ValueError, match="ROI calculation 'bad' failed"):
+        det.read()
+    assert refl.read() == {"refl": previous["refl"]}
+    for signal in snapshot_signals(det):
+        assert signal.read()[signal.name] == previous[signal.name]
+    with pytest.raises(RuntimeError, match="unavailable"):
+        det.calculations["bad"].get()
+    det.remove_roi_calculation("bad")
+    assert det.read()["refl"]["value"] == 1000
+
+
+def test_calculation_inputs_cannot_be_mutated(detector):
+    def mutate(roi):
+        roi[1] = 999
+        return roi[1]
+
+    detector.add_roi_calculation("bad", mutate)
+    with pytest.raises(ValueError, match="does not support item assignment"):
+        detector.read()
+    assert detector._correction_snapshot is None
+
+
+def test_calculation_registration_validation_and_removal(detector):
+    det = detector
+    for name in ("", "with spaces", "_private", 1, det.stats1.total.name, det._image_name):
+        with pytest.raises(ValueError):
+            det.add_roi_calculation(name, lambda roi: roi[1])
+    for kwargs in ({"corrected": 1}, {"description": None}):
+        with pytest.raises(ValueError):
+            det.add_roi_calculation("refl", lambda roi: roi[1], **kwargs)
+    with pytest.raises(ValueError):
+        det.add_roi_calculation("refl", "roi[1]")
+    assert not det.calculations
+    refl = det.add_roi_calculation("refl", lambda roi: roi[1])
+    with pytest.raises(ValueError, match="already in use"):
+        det.add_roi_calculation("refl", lambda roi: roi[2])
+    det.hint_calculations("refl")
+    det.read()
+    det.remove_roi_calculation("refl")
+    assert "refl" not in det.read()
+    assert "refl" not in det.describe()
+    assert "refl" not in det.hints["fields"]
+    with pytest.raises(RuntimeError, match="unavailable"):
+        refl.get()
+    det.add_roi_calculation("refl", lambda roi: roi[2], corrected=False)
+    assert det.read()["refl"]["value"] == 2
+
+
+def test_calculation_changes_disallowed_while_staged_or_reading(detector):
+    det = detector
+    det.add_roi_calculation("refl", lambda roi: roi[1])
+    det._staged = Staged.yes
+    try:
+        for change in (lambda: det.add_roi_calculation("new", lambda roi: 1),
+                       lambda: det.remove_roi_calculation("refl"),
+                       lambda: det.hint_calculations("refl")):
+            with pytest.raises(RuntimeError, match="between runs"):
+                change()
+    finally:
+        det._staged = Staged.no
+    det.add_roi_calculation("bad", lambda roi: det.remove_roi_calculation("refl"))
+    with pytest.raises(ValueError, match="between runs"):
+        det.read()
+    assert set(det.calculations) == {"refl", "bad"}
+
+
+def test_calculation_detects_later_field_collision(detector):
+    det = detector
+    det.add_roi_calculation("refl", lambda roi: roi[1])
+    det.threshold.name = "refl"
+    det.threshold.kind = "normal"
+    with pytest.raises(ValueError, match="collides"):
+        det.describe()
+    with pytest.raises(ValueError, match="collides"):
+        det.read()
+    assert det._correction_snapshot is None

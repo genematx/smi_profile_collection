@@ -17,9 +17,11 @@ from ophyd import (
 )
 from ophyd.signal import SignalRO
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from numbers import Integral, Real
 from threading import RLock
+from types import MappingProxyType
+from dataclasses import dataclass
 import math
 
 from ophyd.areadetector.cam import PilatusDetectorCam
@@ -93,6 +95,14 @@ class StatsWCentroid(StatsPluginV33):
             if not isinstance(component, _SnapshotSignal):
                 result.update(component.read())
         return result
+
+
+@dataclass(frozen=True)
+class _ROICalculation:
+    signal: _SnapshotSignal
+    function: Callable
+    corrected: bool
+    description: str
 
 
 def hint_pilatus_stats(detector, stats, *, corrected=False):
@@ -237,6 +247,7 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
         self._correction_snapshot = None
         self._snapshot_lock = RLock()
         self._snapshot_reading = False
+        self._roi_calculations = OrderedDict()
         # Establish the minimal parent readout once, not on every hint selection.
         # Instance setup adds the existing SAXS/WAXS motor/camera readouts.
         kwargs.setdefault("read_attrs", [
@@ -305,6 +316,100 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
                     leaf.kind |= Kind.hinted
         return {"stats": selection, "corrected": corrected,
                 "fields": list(self.hints["fields"])}
+
+    @property
+    def calculations(self):
+        """Named read-only calculation signals (not dynamically added Components)."""
+        return MappingProxyType({name: calc.signal for name, calc in self._roi_calculations.items()})
+
+    def _check_calculation_configuration(self):
+        if self._staged != Staged.no or self._snapshot_reading:
+            raise RuntimeError("Configure ROI calculations between runs, while unstaged and not reading")
+
+    def add_roi_calculation(self, name, function, *, corrected=True, description=""):
+        """Register ``function(roi)`` as an exactly named scalar event field.
+
+        ``roi`` is an immutable mapping of stats indices 1–5 to this read's totals.
+        Use a pure function returning a finite number, e.g.::
+
+            det.add_roi_calculation(
+                "refl", lambda roi: roi[1] - 0.5 * (roi[4] - roi[1]),
+                corrected=True, description="ROI1 minus surrounding background")
+
+        Register between runs. Names must be unique across all devices in a stream.
+        Returns a read-only signal exposing the last successful parent snapshot.
+        """
+        with self._snapshot_lock:
+            self._check_calculation_configuration()
+            if not isinstance(name, str) or not name.isidentifier() or name.startswith("_"):
+                raise ValueError("Calculation name must be a public identifier, e.g. 'refl'")
+            if not callable(function):
+                raise ValueError("Calculation must be callable")
+            if not isinstance(corrected, bool) or not isinstance(description, str):
+                raise ValueError("corrected must be boolean and description must be a string")
+            existing = {walk.item.name for walk in self.walk_signals()}
+            existing.update(self._roi_calculations)
+            existing.add(self._image_name)
+            if name in existing:
+                raise ValueError(f"Field name already in use: {name}")
+            signal = _SnapshotSignal(name=name, parent=self, kind="normal")
+            self._roi_calculations[name] = _ROICalculation(signal, function, corrected, description)
+            return signal
+
+    def remove_roi_calculation(self, name):
+        """Remove a calculation between runs; remaining fields/hints are preserved."""
+        with self._snapshot_lock:
+            self._check_calculation_configuration()
+            calc = self._roi_calculations.pop(name)
+            if self._correction_snapshot is not None:
+                self._correction_snapshot = {
+                    signal: reading for signal, reading in self._correction_snapshot.items()
+                    if signal is not calc.signal
+                }
+
+    def hint_calculations(self, names, *, clear_stats=True):
+        """Replace calculation hints, normally clearing ROI-total hints.
+
+        All calculations and raw/corrected totals remain recorded. Pass
+        ``clear_stats=False`` to retain the current stats hints as well.
+        """
+        with self._snapshot_lock:
+            self._check_calculation_configuration()
+            if not isinstance(clear_stats, bool):
+                raise ValueError("clear_stats must be boolean")
+            if isinstance(names, str):
+                names = [names]
+            try:
+                names = list(names)
+            except TypeError as exc:
+                raise ValueError("names must be a name or iterable of names") from exc
+            if any(not isinstance(name, str) or name not in self._roi_calculations for name in names):
+                raise ValueError("Unknown ROI calculation name")
+            if clear_stats:
+                self.hint_stats([])
+            for name, calc in self._roi_calculations.items():
+                calc.signal.kind = "hinted" if name in names else "normal"
+            return {"calculations": [name for name in self._roi_calculations if name in names],
+                    "fields": list(self.hints["fields"])}
+
+    @property
+    def hints(self):
+        result = super().hints
+        for calc in self._roi_calculations.values():
+            if calc.signal.kind & Kind.normal:
+                result["fields"].extend(calc.signal.hints["fields"])
+        return result
+
+    def describe(self):
+        result = super().describe()
+        for name, calc in self._roi_calculations.items():
+            if calc.signal.kind & Kind.normal:
+                if name in result:
+                    raise ValueError(f"Calculation field collides with detector readout: {name}")
+                result.update(calc.signal.describe())
+                result[name].update(roi_input="corrected" if calc.corrected else "raw",
+                                    calculation_description=calc.description)
+        return result
 
     @staticmethod
     def _finite_scalar(value, label):
@@ -380,6 +485,24 @@ class Pilatus(SingleTriggerV33, PilatusDetector):
                                       (self.attenuation_energy_eV_used, energy),
                                       (self.attenuation_foils_used, foils)):
                     snapshot[signal] = {"value": value, "timestamp": timestamp}
+                raw_rois = MappingProxyType({n: value for n, (_, value, _) in enumerate(totals, 1)})
+                corrected_rois = MappingProxyType({
+                    n: snapshot[signal]["value"] for n, (signal, _, _) in enumerate(totals, 1)
+                })
+                for name, calc in self._roi_calculations.items():
+                    if not calc.signal.kind & Kind.normal:
+                        continue
+                    if name in result or any(signal.name == name for signal in snapshot):
+                        raise ValueError(f"Calculation field collides with detector readout: {name}")
+                    try:
+                        value = calc.function(corrected_rois if calc.corrected else raw_rois)
+                        value = self._finite_scalar(value, name)
+                    except Exception as exc:
+                        raise ValueError(f"ROI calculation {name!r} failed: {exc}") from exc
+                    # No individual dependency tracking: use the newest timestamp
+                    # among the five stats inputs from this acquisition snapshot.
+                    snapshot[calc.signal] = {"value": value,
+                                             "timestamp": max(t for _, _, t in totals)}
                 # Respect manual leaf omission in read/describe alike; the helper
                 # restores both totals. Required raw totals may never be omitted.
                 for signal, reading in snapshot.items():

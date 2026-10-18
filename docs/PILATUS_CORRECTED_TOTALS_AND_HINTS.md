@@ -78,6 +78,74 @@ These are ordinary Python configuration functions, called before starting a run;
 they do not acquire data or move hardware. Continue passing the parent detector to
 acquisition plans: selecting/reading a child signal does not trigger a Pilatus exposure.
 
+### Named ROI calculations: reflectivity and arbitrary math
+
+Register a Python function between runs. Its `roi` argument is an immutable mapping
+from stats indices 1–5 to the **same parent-read snapshot** used for the event.
+`corrected=True` supplies attenuation-corrected totals; `False` supplies raw totals.
+
+```python
+def reflectivity(roi):
+    return roi[1] - 0.5 * (roi[4] - roi[1])
+
+refl = pil2M.add_roi_calculation(
+    "refl", reflectivity, corrected=True,
+    description="ROI1 - 0.5 * (ROI4 - ROI1)",
+)
+pil2M.hint_calculations("refl")
+RE(bp.count([pil2M]))
+```
+
+The event field and plot label are exactly **`refl`**, without a detector prefix.
+Only `refl` is hinted among stats totals/calculations; all five raw totals, all five
+corrected totals, provenance, and registered calculations are still recorded.
+Unrelated hints are preserved. This is background-subtracted intensity, not incident-
+flux-normalized reflectivity. The factor `0.5` assumes ROI4 contains ROI1 and its
+remaining background area is twice ROI1's area.
+
+Use this template for other scalar math:
+
+```python
+def my_calculation(roi):
+    return (roi[2] + roi[3]) / roi[5]
+
+pil2M.add_roi_calculation("roi_ratio", my_calculation, corrected=False,
+                         description="(ROI2 + ROI3) / ROI5")
+pil2M.hint_calculations(["refl", "roi_ratio"])
+
+# To display ROI totals alongside the calculations:
+pil2M.hint_stats([1, 2, 3], corrected=True)
+pil2M.hint_calculations("refl", clear_stats=False)
+
+# Inspect the last successful read, without recalculating/acquiring:
+pil2M.calculations["refl"].get()  # also available as refl.get()
+
+# Clear calculation hints, retaining stats hints:
+pil2M.hint_calculations([], clear_stats=False)
+
+# Remove or redefine a calculation between runs:
+pil2M.remove_roi_calculation("roi_ratio")
+```
+
+- Functions must return a finite numeric scalar and use only their supplied inputs
+  (no hardware reads or writes). Functions can use ordinary Python/math/NumPy
+  operations. Division by zero, missing ROI indices, non-finite results, and other
+  exceptions fail the parent read without publishing any partial snapshot. Negative
+  background-subtracted intensities are valid.
+- `hint_calculations()` replaces calculation hints and by default clears stats-total
+  hints; `hint_stats()` preserves calculation hints. Neither removes recorded fields.
+- Names must be public Python identifiers and unique within the detector. Use distinct
+  names across devices in a stream, e.g. `refl` and `waxs_refl` if both detectors have
+  calculations. Duplicate registration is rejected; remove first to redefine.
+- Registrations last for the Python session and are not enabled automatically at
+  startup. Configure/register/remove between runs; these methods reject staged or
+  currently-reading detectors. The returned signals are read-only and available via
+  `detector.calculations`, not dynamically added Ophyd Components or `read_attrs`.
+- Calculation timestamps use the latest of the five stats timestamps in the snapshot.
+  The descriptor records `roi_input` (raw/corrected) and the supplied
+  `calculation_description`; provide the formula there for later interpretation.
+  Python function code is not automatically serialized into the run.
+
 ### Selection contract
 
 - Accept one integer or an iterable of integers in 1–5; allow an empty iterable.

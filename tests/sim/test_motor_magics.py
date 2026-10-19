@@ -207,6 +207,7 @@ def test_exposure_plan_dispatch_and_readback(console, capsys, args, expected):
     "xrscan -1 3", "xrscan 0 3", "xrscan 2 0", "xrscan 1e999 3", "xrscan 1 3 extra",
     "exp 0", "exp -1", "exp 1 0.5", "exp nan", "exp 1 inf", "exp 1 2 3",
     "exp 1e-300 1e300", "wh extra", "snaps 1", "snapw extra", "snapsw 2",
+    "a 0", "a -1", "a nan", "a inf", "a 1e999", "a 1+2", "a 1234 extra",
 ])
 def test_invalid_new_commands_never_call_re(console, line):
     re = Mock(state="idle")
@@ -217,7 +218,7 @@ def test_invalid_new_commands_never_call_re(console, line):
     console.user_ns["det_exposure_time"].assert_not_called()
 
 
-@pytest.mark.parametrize("command", ["x", "xscan", "xrscan", "xsscan", "syscan", "wh", "exp", "snaps", "snapw", "snapsw"])
+@pytest.mark.parametrize("command", ["x", "xscan", "xrscan", "xsscan", "syscan", "wh", "exp", "snaps", "snapw", "snapsw", "a", "vent", "pump"])
 @pytest.mark.parametrize("args", ["?", "123 ?", "--help"])
 def test_help_for_all_commands_never_reads_or_executes(console, capsys, command, args):
     re = Mock(state="idle")
@@ -256,7 +257,7 @@ def test_exposure_missing_detector_preserves_other_readout(console, capsys):
     assert "N/A" in output and "pil900KW" in output and "0.101" in output
 
 
-@pytest.mark.parametrize("line", ["xscan -1 1 3", "xrscan 1 3", "exp 1", "snaps", "snapw", "snapsw"])
+@pytest.mark.parametrize("line", ["xscan -1 1 3", "xrscan 1 3", "exp 1", "snaps", "snapw", "snapsw", "a 1234", "vent", "pump"])
 def test_new_actions_reject_paused_re(console, line):
     re = Mock(state="paused")
     console.user_ns["RE"] = re
@@ -266,7 +267,7 @@ def test_new_actions_reject_paused_re(console, line):
     re.assert_not_called()
 
 
-@pytest.mark.parametrize("line", ["xscan -1 1 3", "xrscan 1 3", "exp 1", "snaps", "wh", "exp"])
+@pytest.mark.parametrize("line", ["xscan -1 1 3", "xrscan 1 3", "exp 1", "snaps", "wh", "exp", "a", "a 1234"])
 def test_new_commands_reject_nested_use(console, line):
     re = Mock(state="idle")
     console.user_ns["RE"] = re
@@ -288,8 +289,9 @@ def test_color_and_plain_output(console, capsys, monkeypatch):
 
 @pytest.mark.parametrize("command,plan_name", [
     ("so", "shopen"), ("sopen", "shopen"), ("sc", "shclose"), ("sclose", "shclose"),
+    ("vent", "vent_waxs"), ("pump", "pump_waxs"),
 ])
-def test_shutter_aliases(console, command, plan_name):
+def test_plan_aliases(console, command, plan_name):
     state = Signal(name="shutter_state", value=0)
     plan = Mock(side_effect=lambda: bps.mv(state, 1))
     console.user_ns[plan_name] = plan
@@ -318,7 +320,7 @@ def test_stop_paused_run(console):
     assert next(doc for name, doc in documents if name == "stop")["exit_status"] == "success"
 
 
-@pytest.mark.parametrize("command", ["so", "sopen", "sc", "sclose", "stop", "help"])
+@pytest.mark.parametrize("command", ["so", "sopen", "sc", "sclose", "stop", "help", "vent", "pump"])
 def test_control_commands_reject_arguments_and_nested_calls(console, command):
     re = Mock(state="idle")
     console.user_ns["RE"] = re
@@ -349,10 +351,11 @@ def test_control_help_without_re(console, capsys, command):
 @pytest.mark.parametrize("source", ["help", "%help", "help ?", "%help ?"])
 def test_boxed_guide(console, capsys, source):
     del console.user_ns["RE"]
+    console.colors = "nocolor"
     assert console.run_cell(source).success
     output = capsys.readouterr().out
     assert "┌" in output and "└" in output
-    for command in ("xscan", "xrscan", "wh", "exp", "snapsw", "sopen", "sclose", "stop"):
+    for command in ("xscan", "xrscan", "wh", "exp", "snapsw", "sopen", "sclose", "stop", "a 1234", "vent", "pump"):
         assert command in output
 
 
@@ -372,6 +375,37 @@ def test_reloading_does_not_duplicate_help_transform(console):
     load_ipython_extension(console)
     load_ipython_extension(console)
     assert sum(bool(getattr(t, "_smi_bare_help", False)) for t in console.input_transformers_cleanup) == 1
+
+
+@pytest.mark.parametrize("target", ["1234", "1", "1.5e3"])
+def test_attenuation_set_and_actual_readback(console, capsys, target):
+    attenuation = Signal(name="attenuation", value=20)
+
+    def read_state():
+        assert attenuation.get() == float(target)
+        assert console.user_ns["RE"].state == "idle"
+        return dict(attenuation_factor=1250, transmission=0.0008,
+                    energy_eV=16150, inserted=["1_2", "2_3"])
+
+    attenuation.read_state = Mock(side_effect=read_state)
+    console.user_ns["attenuation"] = attenuation
+    assert console.run_cell(f"a {target}").success
+    attenuation.read_state.assert_called_once_with()
+    output = capsys.readouterr().out
+    assert "1250x" in output and "0.0008" in output and "1_2,2_3" in output
+
+
+def test_attenuation_read_without_re(console, capsys):
+    del console.user_ns["RE"]
+    attenuation = Mock()
+    attenuation.read_state.return_value = dict(
+        attenuation_factor=1, transmission=1, energy_eV=16150, inserted=[])
+    console.user_ns["attenuation"] = attenuation
+    assert console.run_cell("a").success
+    attenuation.read_state.assert_called_once_with()
+    attenuation.set.assert_not_called()
+    output = capsys.readouterr().out
+    assert "1x" in output and "16150.00" in output and "none" in output
 
 
 def test_energy_move_then_detector_settings(console):

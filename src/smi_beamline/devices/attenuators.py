@@ -420,6 +420,7 @@ class AttenuatorSet(Device):
     requested_factor = Cpt(Signal, value=0.0, kind="config")
     #: True if the achieved factor was within ``tolerance`` of the last request.
     within_tolerance = Cpt(Signal, value=True, kind="config")
+    calibration_id = Cpt(Signal, value=_ad.CALIBRATION_ID, kind="config")
 
     # --- selection policy (config; recorded with every run) -------------------
     #: hard cap on how many foils a requested factor may use (fewer = less scatter).
@@ -517,6 +518,7 @@ class AttenuatorSet(Device):
             "attenuation_factor": factor if _math_isfinite(factor) else _ad_MAX_FACTOR,
             "transmission": trans if strict else max(trans, 1.0 / _ad_MAX_FACTOR),
             "description": self._describe(labels),
+            "calibration_id": _ad.CALIBRATION_ID,
         }
 
     def compute(self, labels=None, energy_eV=None):
@@ -545,6 +547,7 @@ class AttenuatorSet(Device):
             trans = 1.0 / _ad_MAX_FACTOR
 
         self.energy_eV.put(energy)
+        self.calibration_id.put(_ad.CALIBRATION_ID)
         self.attenuation_factor.put(factor)
         self.transmission.put(trans)
         self.description.put(desc)
@@ -552,6 +555,7 @@ class AttenuatorSet(Device):
 
         state = {"attenuation_factor": factor, "transmission": trans,
                  "energy_eV": energy, "description": desc, "inserted": list(labels)}
+        state["calibration_id"] = _ad.CALIBRATION_ID
         # Mirror into RE.md so a run started after this change carries the up-to-date value
         # in its START document (bluesky snapshots RE.md at open_run).  Never let a metadata
         # write break a compute() that runs mid-scan.
@@ -582,6 +586,7 @@ class AttenuatorSet(Device):
             foils["att{}".format(label)] = {
                 "material": "{}_{:g}um".format(base_info["formula"], base_info["thickness_um"]),
                 "thickness": "{}x".format(mult),
+                **_ad.calibration_metadata(label),
             }
         return {
             "foils": foils,
@@ -589,6 +594,7 @@ class AttenuatorSet(Device):
             "transmission": state.get("transmission"),
             "energy_eV": state.get("energy_eV"),
             "description": state.get("description"),
+            "calibration_id": _ad.CALIBRATION_ID,
         }
 
     def _update_run_md(self, state, labels):

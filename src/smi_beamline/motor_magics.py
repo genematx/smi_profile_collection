@@ -42,7 +42,8 @@ SNAPSHOTS = {
     "snapsw": ("pil2M", "pil900KW"),
 }
 SHUTTERS = {"so": "shopen", "sopen": "shopen", "sc": "shclose", "sclose": "shclose"}
-COMMANDS = (*MOTOR_MAGICS, *SCAN_MAGICS, "wh", "status", "exp", "e", *SNAPSHOTS, *SHUTTERS, "stop", "help")
+WAXS_PLANS = {"vent": "vent_waxs", "pump": "pump_waxs"}
+COMMANDS = (*MOTOR_MAGICS, *SCAN_MAGICS, "wh", "status", "exp", "e", "a", *SNAPSHOTS, *SHUTTERS, *WAXS_PLANS, "stop", "help")
 ARGUMENT_COLORS = ("94", "92", "95")  # blue, green, magenta
 ENERGY_MATCH_TOLERANCE_EV = 100.0
 _SYNTAX_TOKEN = re.compile(
@@ -65,6 +66,15 @@ def _help(command):
             "Absolute energy in eV; VALUE > 0. The existing set_energy helper also "
             "moves energy to that target before updating detector settings."
         )
+    if command == "a":
+        return (
+            "%a: report current attenuation factor (1/T), transmission, energy and foils; no RE call.\n"
+            "%a VALUE: RE(bps.mv(attenuation, VALUE)), then report the achieved attenuation.\n"
+            "Finite factor VALUE >= 1; 1 removes attenuation. The existing attenuator "
+            "selects a foil combination at the current energy, so the achieved factor may differ."
+        )
+    if command in WAXS_PLANS:
+        return f"%{command}: RE({WAXS_PLANS[command]}()); uses the existing WAXS {command} plan."
     if command in SHUTTERS:
         return f"%{command}: RE({SHUTTERS[command]}()); uses the existing shutter/feedback plan."
     if command == "stop":
@@ -315,6 +325,14 @@ def _energies(shell):
         print(_color(shell, error, "33"))
 
 
+def _attenuation(shell):
+    state = _namespace(shell, "attenuation").read_state()
+    _table(shell, ["Attenuation (1/T)", "Transmission", "Energy (eV)", "Inserted foils"], [[
+        f"{state['attenuation_factor']:.6g}x", f"{state['transmission']:.6g}",
+        f"{state['energy_eV']:.2f}", ",".join(state["inserted"]) or "none",
+    ]])
+
+
 def _guide(shell):
     _table(shell, ["Command / example", "What it does"], [
         ["x y z th ph ch", "Piezo axes: translations um; rotations deg"],
@@ -335,12 +353,16 @@ def _guide(shell):
         ["stop", "RE.stop(): gracefully stop a paused run"],
         ["help / COMMAND ?", "This guide / detailed command help"],
         ["status", "Upstream → downstream device overview (~36 lines)"],
+        ["a / a 1234", "Read attenuation / request factor 1234 (1/T); read back achieved factor"],
+        ["vent", "RE(vent_waxs()): vent the WAXS chamber"],
+        ["pump", "RE(pump_waxs()): pump the WAXS chamber and start the detector"],
     ], command_column=True, description_arguments={
         3: (0, 0),
         5: (0, 1, 2, 1),
         6: (0, 1),
         10: (0, None, 1, 0),  # exp: 0.5 s; fixed 1 image; int(M / N)
         11: (0, 0),
+        18: (0,),
     })
     print(_syntax(shell, "Colors: xscan START STOP POINTS (command; first, second, third numeric argument)."))
     print("Standalone console commands. Prefix with % if a Python name shadows a magic.")
@@ -459,6 +481,21 @@ def _command(shell, command, line):
         _energies(shell)
         return result
 
+    if command == "a":
+        if not tokens:
+            return _attenuation(shell)
+        if len(tokens) != 1:
+            raise UsageError(usage)
+        value = _number(tokens[0], usage)
+        if value < 1:
+            raise UsageError(usage)
+        engine = _idle_re(shell, command)
+        attenuation = _namespace(shell, "attenuation")
+        _echo(shell, command, tokens, f"attenuation: requested factor {value:g} (1/T)")
+        result = engine(bps.mv(attenuation, value))
+        _attenuation(shell)
+        return result
+
     if command == "exp":
         if not tokens:
             return _exposures(shell)
@@ -485,10 +522,11 @@ def _command(shell, command, line):
         engine = _namespace(shell, "RE")
         _echo(shell, command, tokens, "RE.stop()")
         return engine.stop()
-    if command in SHUTTERS:
+    if command in SHUTTERS or command in WAXS_PLANS:
         re = _idle_re(shell, command)
-        plan = _namespace(shell, SHUTTERS[command])
-        _echo(shell, command, tokens, f"RE({SHUTTERS[command]}())")
+        plan_name = SHUTTERS[command] if command in SHUTTERS else WAXS_PLANS[command]
+        plan = _namespace(shell, plan_name)
+        _echo(shell, command, tokens, f"RE({plan_name}())")
         return re(plan())
     re = _idle_re(shell, command)
     detectors = [_namespace(shell, name) for name in SNAPSHOTS[command]]

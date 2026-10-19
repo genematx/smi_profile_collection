@@ -1,5 +1,6 @@
 """Hardware-free commissioning tests. MOVE with attenuator_ab.py."""
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,25 +17,34 @@ spec.loader.exec_module(ab)
 
 
 def simple_test(pairs=3):
-    return dict(id="al9", energy_eV=6000, a=["1_2"], b=["1_2", "2_9"], pairs=pairs)
+    return dict(id="al9", energy_eV=8800, a=["1_1", "1_2", "2_8"],
+                b=["1_1", "1_2", "2_8", "2_9"], pairs=pairs)
 
 
 def test_preview_is_hardware_free_and_counts_exposures():
     plan = ab.attenuator_ab_calibration([simple_test()], dry_run=True, exposure_s=5)
     with pytest.raises(StopIteration) as end:
         next(plan)
-    assert end.value.value["frames"] == 9
-    assert end.value.value["exposure_seconds"] == 45
-    assert end.value.value["estimated_seconds"] > 45
+    assert end.value.value["frames"] == 6
+    assert end.value.value["exposure_seconds"] == 30
+    assert end.value.value["estimated_seconds"] > 30
+    with pytest.raises(ValueError, match="dark_frames must be 0"):
+        ab.preview_ab([simple_test()], dark_frames=3)
     with pytest.raises(ValueError, match="outside"):
         ab.preview_ab([dict(simple_test(), a=[])])
     with pytest.raises(ValueError, match="integer"):
         ab.preview_ab([dict(simple_test(), pairs=0)])
+    with pytest.raises(ValueError, match="8800–20000"):
+        ab.preview_ab([dict(simple_test(), energy_eV=6000)])
+    with pytest.raises(ValueError, match="8800–20000"):
+        ab.make_ab_tests(energies_eV=(6000,))
 
 
 def test_default_design_has_two_energy_coverage_and_identifiable_foils():
     tests = ab.make_ab_tests(pairs=2)
-    counts = {l: 0 for l in ab.ad.FOIL_LAYOUT}
+    assert {t["energy_eV"] for t in tests} == {8800, 16000, 19500}
+    assert all("2_6" not in t["a"] + t["b"] for t in tests)
+    counts = {l: 0 for l in ab.ad.FOIL_LAYOUT if l != "2_6"}
     for energy in {t["energy_eV"] for t in tests}:
         subset = [t for t in tests if t["energy_eV"] == energy]
         x = np.array([[int(l in t["b"])-int(l in t["a"]) for l in counts] for t in subset])
@@ -46,12 +56,12 @@ def test_default_design_has_two_energy_coverage_and_identifiable_foils():
 
 
 def test_synthetic_joint_fit_recovers_non_nominal_thickness():
-    tests = ab.make_ab_tests(energies_eV=(19500,), pairs=5)
+    tests = ab.make_ab_tests(energies_eV=(19500,), pairs=5, excluded_foils=())
     scales = {l: 1 + .01*np.sin(i) for i,l in enumerate(ab.ad.FOIL_LAYOUT)}
     summaries = []
     for t in tests:
         def counts(state):
-            return 5e12*np.exp(-sum(ab.ad.foil_optical_depth(l,19500)*scales[l] for l in state))
+            return 5e12*np.exp(-sum(ab.ad.foil_optical_depth(l,19500,calibrated=False)*scales[l] for l in state))
         a, b = counts(t["a"]), counts(t["b"])
         summaries.append(ab.summarize_test(t, [(a+10,b+10)]*5, [10]*3))
     results, diagnostics = ab.fit_foils(tests, summaries)
@@ -81,6 +91,16 @@ def test_repeat_scatter_and_shared_dark_uncertainty():
 
 def signal(value=0, name="signal"):
     return Signal(value=value, name=name)
+
+
+class ShutterButton(Signal):
+    """IOC command that resets immediately but acknowledges the put."""
+
+    def put(self, value, *, callback=None, **kwargs):
+        super().put(value)
+        super().put(0)
+        if callback is not None:
+            callback()
 
 
 class Bank(Device):
@@ -183,13 +203,17 @@ class Detector(Device):
 
     def trigger(self):
         s = DeviceStatus(self)
+        assert self.shutter.status_pv.get() == 7
+        # Hardware exposure output owns opening/closing; no plan open command.
+        self.shutter.status_pv.put(0)
         is_open = self.shutter.status_pv.get() == 0
         if self.fail_trigger and is_open:
+            self.shutter.status_pv.put(7)
             s.set_exception(RuntimeError("simulated trigger failure"))
             return s
         inserted = [f"{bank.bank_prefix}_{i}" for bank in self.banks for i in range(1,13)
                     if getattr(bank,f"f{i}").status.get() == "Open"]
-        counts = 10.
+        counts = 0.
         if is_open:
             counts += 1e12*self.cam.acquire_time.get()*ab.ad.transmission(inserted,self.energy_read.get()*1000)
         self.stats1.total.put(counts)
@@ -207,6 +231,7 @@ class Detector(Device):
             if not getattr(self,"stale_side",False):
                 self.stats2.unique_id.put(uid)
             self.stats3.unique_id.put(uid)
+        self.shutter.status_pv.put(7)
         s.set_finished()
         return s
 
@@ -218,7 +243,8 @@ class Detector(Device):
 
 @pytest.fixture
 def hardware():
-    shutter = SimpleNamespace(open_cpt=signal(name="open"), close_cpt=signal(name="close"),
+    shutter = SimpleNamespace(open_cpt=ShutterButton(name="open", value=0),
+                              close_cpt=ShutterButton(name="close", value=0),
                               status_pv=signal(7,"shutter_status"))
     shutter.open_cpt.subscribe(lambda **kw: shutter.status_pv.put(0), run=False)
     shutter.close_cpt.subscribe(lambda **kw: shutter.status_pv.put(7), run=False)
@@ -255,7 +281,7 @@ def hardware():
     return detector,shutter,kwargs
 
 
-def test_run_one_uid_streams_order_results_and_cleanup(hardware):
+def test_run_one_uid_streams_order_results_and_cleanup(hardware, capsys):
     detector, shutter, kwargs = hardware
     docs, messages = [], []
     re = RunEngine({},call_returns_result=True)
@@ -270,7 +296,8 @@ def test_run_one_uid_streams_order_results_and_cleanup(hardware):
     assert [e["data"]["ab_state"] for e in events] == list("ABBAAB")
     assert len(result["foil_summary"]) == 1
     assert result["foil_summary"][0]["foil"] == "2_9"
-    assert result["foil_summary"][0]["thickness_scale"] == pytest.approx(1.)
+    assert result["foil_summary"][0]["thickness_scale"] == pytest.approx(
+        ab.ad.effective_thickness_um("2_9")/ab.ad.nominal_thickness_um("2_9"))
     assert shutter.status_pv.get() == 7 and detector.restored
     applies = [m for m in messages if m.command=="set" and m.obj is detector.cam.threshold_apply]
     assert len(applies) == 2
@@ -278,9 +305,24 @@ def test_run_one_uid_streams_order_results_and_cleanup(hardware):
     assert result["shape_summary"][0]["sigma_x_px_variance_delta"] == pytest.approx(7)
     assert "shape_sigma_x_px" in events[0]["data"]
     assert detector.stats1.compute_centroid.get() == 1
-    assert detector.roi1.size.x.get() == 128
+    assert detector.roi1.size.x.get() == 40
     assert detector.roi2.min_xyz.min_x.get()+128 < detector.roi1.min_xyz.min_x.get()
-    assert detector.roi3.min_xyz.min_x.get() > detector.roi1.min_xyz.min_x.get()+128
+    assert detector.roi3.min_xyz.min_x.get() > detector.roi1.min_xyz.min_x.get()+40
+    output = capsys.readouterr().out
+    steps = ["opening run; waiting for initial baseline", "initial baseline complete",
+             "checking Pilatus idle", "staging Pilatus and file plugins",
+             "detector staging complete", "starting alignment geometry",
+             "alignment complete", "tracked energy move to 8800",
+             "sensitivity 8.8 keV: attempt 1/3", "waiting 0 s for sensitivity",
+             "sensitivity 8.8 keV: attempt 2/3", "placing direct-beam ROI",
+             "starting test 1/1", "pair 1/3, state A",
+             "moving bank 1", "moving bank 2", "requested stack confirmed",
+             "triggering with detector-controlled shutter",
+             "fitting completed tests", "unstaging Pilatus", "detector unstaging complete",
+             "cleanup: closing", "cleanup: restoring", "run closed:"]
+    cursor = 0
+    for step in steps:
+        cursor = output.index(step, cursor) + len(step)
 
 
 @pytest.mark.parametrize("failure", ["saturate", "fail_trigger"])
@@ -310,8 +352,8 @@ def test_sensitivity_waits_reapplies_and_fails_unconfirmed(hardware):
             messages.append(msg)
             return bps.null(), None
         return None,None
-    re(plan_mutator(ab._sensitivity(detector,6000,20),skip_sleep))
-    assert len([m for m in messages if m.command=="sleep" and m.args==(20,)]) == 2
+    re(plan_mutator(ab._sensitivity(detector,6000),skip_sleep))
+    assert len([m for m in messages if m.command=="sleep" and m.args==(30,)]) == 2
     detector.cam.threshold_apply.unsubscribe_all()
     detector.energy_read.put(12)
     with pytest.raises(RuntimeError,match="failed to confirm"):
@@ -320,8 +362,8 @@ def test_sensitivity_waits_reapplies_and_fails_unconfirmed(hardware):
 
 def test_multiple_energies_one_run_reapplies_each_time(hardware):
     detector,shutter,kwargs = hardware
-    t2 = dict(id="al9_high", energy_eV=8800, a=["1_3","1_9","2_10"],
-              b=["1_3","1_9","2_10","2_9"],pairs=2)
+    t2 = dict(id="al9_high", energy_eV=19500, a=["1_2", "1_3", "1_6", "2_11"],
+              b=["1_2", "1_3", "1_6", "2_11", "2_9"], pairs=2)
     docs, messages = [],[]
     re = RunEngine({},call_returns_result=True)
     re.subscribe(lambda n,d: docs.append((n,d)))
@@ -329,7 +371,10 @@ def test_multiple_energies_one_run_reapplies_each_time(hardware):
     result = re(ab.attenuator_ab_calibration([simple_test(2),t2],**kwargs)).plan_result
     assert len([d for n,d in docs if n=="start"]) == 1
     assert len(result["foil_summary"]) == 2
-    assert all(r["thickness_scale"] == pytest.approx(1.) for r in result["foil_summary"])
+    assert {r["energy_eV"] for r in result["foil_summary"]} == {8800, 19500}
+    assert all(r["thickness_scale"] == pytest.approx(
+        ab.ad.effective_thickness_um(r["foil"])/ab.ad.nominal_thickness_um(r["foil"]))
+        for r in result["foil_summary"])
     assert len([m for m in messages if m.command=="set" and m.obj is detector.cam.threshold_apply]) == 4
     stage_index = next(i for i,m in enumerate(messages) if m.command in ("stage","stage_all"))
     assert any(m.command=="set" and m.obj is detector.cam.num_images for m in messages[:stage_index])
@@ -352,7 +397,7 @@ def test_stale_stats_fail_closed(hardware,monkeypatch,stale_channel):
 
 def test_roi_bounds_and_nonoverlap():
     rects = ab.beam_roi_layout((500,600),(1475,1679))
-    assert rects == [(436,568,128,64),(292,536,128,128),(580,536,128,128)]
+    assert rects == [(480,580,40,40),(336,536,128,128),(536,536,128,128)]
     with pytest.raises(ValueError,match="bounds"):
         ab.beam_roi_layout((100,100),(1475,1679))
 
@@ -387,3 +432,325 @@ def test_shape_optional_and_geometry_failure_closed(hardware):
     with pytest.raises(ValueError,match="bounds"):
         re(ab.attenuator_ab_calibration([simple_test(1)],**kwargs))
     assert shutter.status_pv.get() == 7
+
+
+@pytest.mark.parametrize("failure", ["status", "readback"])
+def test_stuck_foil_skips_partial_test_and_continues(hardware, monkeypatch, capsys, failure):
+    detector, shutter, kwargs = hardware
+    bank = kwargs["attenuators2"]
+    original = bank.set
+    moves = 0
+
+    def stuck(wanted):
+        nonlocal moves
+        assert shutter.status_pv.get() == 7
+        moves += 1
+        # One complete pair succeeds; then f9 refuses to retract in BA order.
+        if moves >= 4 and bank.f9.status.get() == "Open" and "f9" not in wanted:
+            original(list(wanted) + ["f9"])
+            status = DeviceStatus(bank)
+            if failure == "status":
+                status.set_exception(TimeoutError("2_9 refuses to retract"))
+            else:
+                status.set_finished()  # a lying status must still not allow exposure
+            return status
+        return original(wanted)
+
+    monkeypatch.setattr(bank, "set", stuck)
+    # This next test can run with f9 remaining inserted in both states.
+    good = dict(id="al18", energy_eV=8800, a=simple_test()["b"],
+                b=simple_test()["b"] + ["2_10"], pairs=2)
+    docs = []
+    re = RunEngine({}, call_returns_result=True)
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    result = re(ab.attenuator_ab_calibration([simple_test(), good], **kwargs)).plan_result
+    skip, = result["skipped_tests"]
+    assert skip["test_id"] == "al9" and skip["completed_pairs"] == 1
+    assert skip["pair"] == 1 and skip["state"] == "A"
+    assert json.loads(skip["actual_states_json"])["2_9"] == "Open"
+    assert [s["test_id"] for s in result["ab_summary"]] == ["al18"]
+    assert [s["test_id"] for s in result["shape_summary"]] == ["al18"]
+    assert [r["foil"] for r in result["foil_summary"]] == ["2_10"]
+    assert "2_9" in result["fit_diagnostics"][0]["unidentifiable"]
+    streams = {d["uid"]: d["name"] for n, d in docs if n == "descriptor"}
+    events = [d["data"] for n, d in docs if n == "event" and streams[d["descriptor"]] == "primary"]
+    assert [d["ab_state"] for d in events if d["ab_test_id"] == "al9"] == list("ABB")
+    assert any(n == "event" and d["data"].get("skip_test_id") == "al9" for n, d in docs)
+    assert [d for n, d in docs if n == "stop"][0]["exit_status"] == "success"
+    assert shutter.status_pv.get() == 7 and detector.restored
+    assert "1/2 tests completed; 1 skipped" in capsys.readouterr().out
+
+
+def test_all_tests_skipped_reports_zero_rank_and_continues_energy(hardware, monkeypatch):
+    detector, shutter, kwargs = hardware
+    bank = kwargs["attenuators1"]
+
+    def stuck(wanted):
+        assert shutter.status_pv.get() == 7
+        status = DeviceStatus(bank)
+        status.set_exception(TimeoutError("bank 1 stuck"))
+        return status
+
+    monkeypatch.setattr(bank, "set", stuck)
+    high = dict(id="high", energy_eV=19500, a=["1_2", "1_3", "1_6", "2_11"],
+                b=["1_2", "1_3", "1_6", "2_11", "2_9"], pairs=1)
+    docs = []
+    re = RunEngine({}, call_returns_result=True)
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    result = re(ab.attenuator_ab_calibration([simple_test(), high], **kwargs)).plan_result
+    assert len(result["skipped_tests"]) == 2
+    assert result["ab_summary"] == result["foil_summary"] == []
+    assert len(result["fit_diagnostics"]) == 2
+    assert all(d["rank"] == d["equations"] == 0 and len(d["unidentifiable"]) == 24
+               for d in result["fit_diagnostics"])
+    assert not any(n == "event" and d["data"].get("ab_state") in ("A", "B") for n, d in docs)
+    assert shutter.status_pv.get() == 7 and detector.restored
+
+
+def test_bank_failure_waits_for_all_children_before_next_move(hardware, monkeypatch):
+    import threading
+    from ophyd.status import Status
+
+    _, shutter, kwargs = hardware
+    bank = kwargs["attenuators1"]
+    original = bank.set
+    finished = threading.Event()
+    calls = 0
+
+    def delayed(wanted):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            assert finished.is_set()
+            return original(wanted)
+        failed, pending = Status(), Status()
+        combined = failed & pending
+        failed.set_exception(TimeoutError("first foil stuck"))
+
+        def finish():
+            assert shutter.status_pv.get() == 7
+            finished.set()
+            pending.set_finished()
+
+        threading.Timer(.05, finish).start()
+        return combined
+
+    monkeypatch.setattr(bank, "set", delayed)
+    result = RunEngine({}, call_returns_result=True)(ab.attenuator_ab_calibration(
+        [simple_test(1), dict(simple_test(1), id="retry")], **kwargs)).plan_result
+    assert len(result["skipped_tests"]) == len(result["ab_summary"]) == 1
+    assert result["ab_summary"][0]["test_id"] == "retry"
+
+
+def test_shutter_failure_is_not_treated_as_a_skipped_foil(hardware, monkeypatch):
+    _, shutter, kwargs = hardware
+    original = ab._fast_shutter
+
+    def fail_open(fs, opened):
+        if not opened:
+            raise RuntimeError("shutter failed")
+        yield from original(fs, opened)
+
+    monkeypatch.setattr(ab, "_fast_shutter", fail_open)
+    docs = []
+    re = RunEngine({})
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    with pytest.raises(RuntimeError, match="shutter failed"):
+        re(ab.attenuator_ab_calibration([simple_test()], **kwargs))
+    assert not any(n == "event" and "skip_test_id" in d["data"] for n, d in docs)
+    assert [d for n, d in docs if n == "stop"][0]["exit_status"] == "fail"
+    assert shutter.status_pv.get() == 7
+
+
+def test_unfinished_motion_is_fatal_instead_of_starting_next_test(hardware, monkeypatch):
+    from bluesky import FailedStatus
+    from ophyd.status import Status
+
+    detector, shutter, kwargs = hardware
+    pending = Status()
+    calls = []
+
+    def never_finishes(wanted):
+        calls.append(wanted)
+        return pending
+
+    monkeypatch.setattr(kwargs["attenuators1"], "set", never_finishes)
+    monkeypatch.setattr(ab._BankMove, "completion_timeout", .02)
+    try:
+        with pytest.raises(FailedStatus):
+            RunEngine({})(ab.attenuator_ab_calibration(
+                [simple_test(1), dict(simple_test(1), id="next")], **kwargs))
+        assert len(calls) == 1
+        assert shutter.status_pv.get() == 7 and detector.restored
+    finally:
+        pending.set_finished()
+
+
+def test_shutter_already_closed_does_not_write_command(hardware, monkeypatch):
+    _, shutter, _ = hardware
+
+    def unexpected_put(*args, **kwargs):
+        pytest.fail("Already-closed shutter should not receive a command")
+
+    monkeypatch.setattr(shutter.close_cpt, "put", unexpected_put)
+    RunEngine({})(ab._fast_shutter(shutter, False))
+    assert shutter.status_pv.get() == 7
+
+
+def test_shutter_self_resetting_buttons_use_put_completion(hardware, monkeypatch):
+    _, shutter, _ = hardware
+
+    def forbidden_set(*args, **kwargs):
+        pytest.fail("Do not wait for a command button to latch at 1")
+
+    monkeypatch.setattr(shutter.open_cpt, "set", forbidden_set)
+    monkeypatch.setattr(shutter.close_cpt, "set", forbidden_set)
+    re = RunEngine({})
+    re(ab._fast_shutter(shutter, True))
+    assert shutter.status_pv.get() == 0 and shutter.open_cpt.get() == 0
+    re(ab._fast_shutter(shutter, False))
+    assert shutter.status_pv.get() == 7 and shutter.close_cpt.get() == 0
+
+
+def test_shutter_put_acknowledgement_does_not_replace_state_confirmation(hardware, monkeypatch):
+    _, shutter, _ = hardware
+    shutter.open_cpt.unsubscribe_all()
+    original = ab._poll
+
+    def quick_poll(signal, predicate, **kwargs):
+        return (yield from original(signal, predicate, timeout=.001, interval=.001,
+                                    description=kwargs["description"]))
+
+    monkeypatch.setattr(ab, "_poll", quick_poll)
+    with pytest.raises(RuntimeError, match="fast shutter open did not confirm"):
+        RunEngine({})(ab._fast_shutter(shutter, True))
+
+
+def test_disconnected_gain_readback_falls_back_and_records_source(hardware, monkeypatch):
+    from ophyd.utils import DisconnectedError
+
+    detector, _, kwargs = hardware
+
+    def disconnected():
+        raise DisconnectedError("gain RBV is not connected")
+
+    monkeypatch.setattr(detector.gain_read, "read", disconnected)
+    # Parent detector.read would also read this simulated component, unlike the
+    # live profile's curated read_attrs. Exercise the fallback through a whole run.
+    detector.read_attrs = [attr for attr in detector.read_attrs if attr != "gain_read"]
+    docs = []
+    re = RunEngine({}, call_returns_result=True)
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    result = re(ab.attenuator_ab_calibration([simple_test(1)], **kwargs)).plan_result
+    assert len(result["ab_summary"]) == 1
+    settings, = [d["data"] for n, d in docs if n == "event" and "sensitivity_gain_readback_confirmed" in d["data"]]
+    assert not settings["sensitivity_gain_readback_confirmed"]
+    assert settings["sensitivity_gain_confirmation_source"] == detector.gain.name
+    assert settings["sensitivity_gain_observed"] == 1
+    assert settings["sensitivity_energy_readback_keV"] == 8.8
+
+
+def test_connected_wrong_gain_still_fails_confirmation(hardware, monkeypatch):
+    detector, _, _ = hardware
+    monkeypatch.setattr(detector.gain_read, "read", lambda: {
+        detector.gain_read.name: {"value": 3, "timestamp": 0}})
+    with pytest.raises(RuntimeError, match="sensitivity failed to confirm"):
+        RunEngine({})(ab._sensitivity(detector, 8800, wait_s=0))
+
+
+@pytest.mark.parametrize("side", [-5., 0., float("nan")])
+def test_no_signal_side_roi_does_not_abort_and_metadata_not_hinted(hardware, monkeypatch, side):
+    detector, shutter, kwargs = hardware
+    original = detector.trigger
+
+    def trigger():
+        result = original()
+        detector.stats2.total.put(side)
+        detector.stats1.sigma_x.put(-1.)
+        return result
+
+    monkeypatch.setattr(detector, "trigger", trigger)
+    def forbidden_open(*args, **kwargs):
+        pytest.fail("Exposure shutter belongs to detector")
+    monkeypatch.setattr(shutter.open_cpt, "put", forbidden_open)
+    docs = []
+    re = RunEngine({}, call_returns_result=True)
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    result = re(ab.attenuator_ab_calibration([simple_test(2)], **kwargs)).plan_result
+    assert len(result["ab_summary"]) == 1
+    shape, = result["shape_summary"]
+    assert not shape["moments_valid"]
+    assert shape["left_normalized_valid"] == bool(np.isfinite(side))
+    if side < 0:
+        assert not shape["left_poisson_valid"]
+        assert shape["left_per_pixel_per_core_a"] < 0
+        assert shape["left_sem_valid"]
+    descriptors = [d for n, d in docs if n == "descriptor"]
+    assert "dark" not in [d["name"] for d in descriptors]
+    settings = next(d for d in descriptors if d["name"] == "detector_settings")
+    assert all(h["fields"] == [] for h in settings["hints"].values())
+    primary = next(d for d in descriptors if d["name"] == "primary")
+    assert primary["hints"]["ab_raw_counts"]["fields"] == ["ab_raw_counts"]
+
+
+def test_zero_core_is_saved_and_skipped_not_fitted(hardware, monkeypatch):
+    detector, _, kwargs = hardware
+    original = detector.trigger
+    def trigger():
+        result = original()
+        detector.stats1.total.put(0)
+        return result
+    monkeypatch.setattr(detector, "trigger", trigger)
+    result = RunEngine({}, call_returns_result=True)(ab.attenuator_ab_calibration(
+        [simple_test(2)], **kwargs)).plan_result
+    assert result["ab_summary"] == result["foil_summary"] == []
+    assert result["skipped_tests"][0]["failure_type"] == "insufficient_signal"
+    assert result["skipped_tests"][0]["completed_pairs"] == 2
+
+
+def test_excluded_foil_rejected_in_old_tests_and_alignment_selector_bypassed(hardware):
+    _, _, kwargs = hardware
+    old = dict(simple_test(), b=simple_test()["b"] + ["2_6"])
+    with pytest.raises(ValueError, match="excluded foils.*regenerate"):
+        ab.preview_ab([old])
+    with pytest.raises(ValueError, match="Unknown or duplicate"):
+        ab.make_ab_tests(excluded_foils=("2f6",))
+
+    class AutomaticAttenuation:
+        name = "attenuation"
+        def set(self, value):
+            pytest.fail("Alignment must not use the unrestricted stack selector")
+
+    def alignment(**kwargs):
+        yield from bps.abs_set(AutomaticAttenuation(), 1e6, wait=True)
+
+    kwargs["smi"].modeAlignment = alignment
+    docs = []
+    re = RunEngine({}, call_returns_result=True)
+    re.subscribe(lambda n, d: docs.append((n, d)))
+    result = re(ab.attenuator_ab_calibration([simple_test(1)], **kwargs)).plan_result
+    assert len(result["ab_summary"]) == 1
+    assert next(d for n, d in docs if n == "start")["excluded_foils"] == ["2_6"]
+
+
+@pytest.mark.parametrize("energies", [(16000, 19500), (16500, 17000)])
+def test_targeted_followup_identifies_only_targets_with_reference_cancellation(energies):
+    tests = ab.make_followup_tests(energies_eV=energies)
+    assert len(tests) == 6
+    report = ab.preview_ab(tests, exposure_s=10, excluded_foils=())
+    assert report["frames"] == 24
+    summaries = []
+    for t in tests:
+        assert set(t["b"]) - set(t["a"]) in ({"2_3"}, {"2_4"}, {"2_6"})
+        assert set(t["a"]) < set(t["b"])
+        assert 1e-9 <= t["modeled_b"] <= t["modeled_a"] <= 1e-6
+        a, b = t["modeled_a"]*1e13, t["modeled_b"]*1e13
+        summaries.append(ab.summarize_test(t, [(a,b)]*2, []))
+    fitted, diag = ab.fit_foils(tests, summaries)
+    assert len(fitted) == 6
+    assert all(d["rank"] == 3 for d in diag)
+    assert all(r["foil"] in ("2_3", "2_4", "2_6") for r in fitted)
+    assert all(r["thickness_scale"] == pytest.approx(
+        ab.ad.effective_thickness_um(r["foil"])/ab.ad.nominal_thickness_um(r["foil"])) for r in fitted)
+    with pytest.raises(ValueError, match="reference foil"):
+        ab.make_followup_tests(targets=("1_3",))

@@ -40,10 +40,67 @@ def test_base_curves_aligned_to_energy_grid():
 def test_optical_depth_nonnegative_and_monotone_ish_with_thickness():
     # thicker foil of same material -> more optical depth at any energy
     E = 10000.0
-    od1 = ad.foil_optical_depth("2_9", E)    # Al 9um x1
-    od8 = ad.foil_optical_depth("2_12", E)   # Al 9um x8
+    od1 = ad.foil_optical_depth("2_9", E, calibrated=False)    # nominal Al 9um x1
+    od8 = ad.foil_optical_depth("2_12", E, calibrated=False)   # nominal Al 9um x8
     assert od1 >= 0
     assert od8 == pytest.approx(8 * od1, rel=1e-9)   # exact linear scaling
+
+
+def test_measured_thickness_corrections_and_nominal_fallback():
+    from smi_beamline.devices import attenuator_calibration as cal
+    assert len(cal.ACCEPTED) == 23
+    assert set(ad.FOIL_LAYOUT) - set(cal.ACCEPTED) == {"1_4"}
+    assert ad.effective_thickness_um("1_1") == pytest.approx(62.20276, abs=1e-5)
+    for label in ad.FOIL_LAYOUT:
+        scale = ad.effective_thickness_um(label)/ad.nominal_thickness_um(label)
+        for energy in (8800, 16000, 19500):
+            nominal = ad.foil_optical_depth(label, energy, calibrated=False)
+            assert ad.foil_optical_depth(label, energy) == pytest.approx(nominal*scale)
+        if label in cal.UNRESOLVED:
+            assert scale == 1
+    # Corrections are per physical foil, not shared base-thickness multiples.
+    assert ad.foil_optical_depth("2_12", 16000) != pytest.approx(8*ad.foil_optical_depth("2_9",16000))
+
+
+def test_calibration_agreement_and_scatter_inflation():
+    from smi_beamline.devices import attenuator_calibration as cal
+    assert not cal.RESULTS["2_3"]["accepted"]
+    assert not cal.RESULTS["2_4"]["accepted"]
+    for label, result in cal.RESULTS.items():
+        if not result["accepted"]:
+            continue
+        a, sa, b, sb = cal.MEASUREMENTS_UM[label]
+        assert result["agreement_z"] <= 3
+        assert min(a,b) <= result["effective_thickness_um"] <= max(a,b)
+        assert result["thickness_sigma_um"] >= math.sqrt(1/(1/sa**2 + 1/sb**2))
+
+
+def test_followup_uses_low_energy_values_and_retains_disagreement():
+    from smi_beamline.devices import attenuator_calibration as cal
+    assert cal.FOLLOWUP_RESULTS["2_3"]["agreement_z"] == pytest.approx(3.724375, abs=1e-5)
+    assert cal.FOLLOWUP_RESULTS["2_4"]["agreement_z"] == pytest.approx(4.319831, abs=1e-5)
+    assert all(not r["accepted"] for r in cal.FOLLOWUP_RESULTS.values())
+    assert cal.FOLLOWUP_SINGLE_ENERGY_UM["2_6"][16000][0] == pytest.approx(219.115923)
+    for label, value, sigma in (("2_3",80.801629856,.037231804),
+                                ("2_4",181.884971861,.100291060),
+                                ("2_6",219.115923040,.550377025)):
+        assert ad.effective_thickness_um(label) == pytest.approx(value)
+        assert cal.ACCEPTED[label]["thickness_sigma_um"] == pytest.approx(sigma)
+        assert label in cal.REMAINING_ISSUES
+    assert ad.calibration_metadata("2_3")["source_uids"] == [
+        cal.FOLLOWUP_SOURCE_UID, cal.INTERMEDIATE_SOURCE_UID, cal.REPEAT_SOURCE_UID]
+    assert ad.calibration_metadata("2_6")["measured_energies_eV"] == [16000]
+
+
+def test_calibrated_combination_and_selection_use_measured_thickness():
+    e = 16000
+    expected = math.exp(sum(ad.foil_optical_depth(l,e,calibrated=False)*
+        ad.effective_thickness_um(l)/ad.nominal_thickness_um(l) for l in ("1_1","1_5")))
+    assert ad.attenuation_factor(["1_1","1_5"],e) == pytest.approx(expected)
+    target = ad.attenuation_factor(["1_1"],e)
+    labels, factor, ok = ad.select_foils(target,e,candidates=["1_1"],max_foils=1,tolerance=1e-9)
+    assert labels == ("1_1",) and ok
+    assert factor == pytest.approx(target)
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +175,9 @@ def test_select_hits_target_within_tolerance():
 
 
 def test_select_prefers_fewer_foils():
-    # at 10 keV a 2-foil combo lands within 10% of 10x; the selector must NOT use 3 foils.
-    labels, factor, ok = ad.select_foils(10, 10000.0, tolerance=0.10)
+    # A known two-foil target must not cause the selector to choose three foils.
+    target = ad.attenuation_factor(["2_9", "2_11"], 10000.)
+    labels, factor, ok = ad.select_foils(target, 10000.0, tolerance=0.10)
     assert ok
     assert len(labels) <= 2
 

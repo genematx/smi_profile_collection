@@ -131,11 +131,11 @@ def test_strict_state_does_not_floor_transmission_or_cap_factor(attset, monkeypa
     from smi_beamline.devices.attenuators import _ad_MAX_FACTOR
 
     att, _, _ = attset
-    monkeypatch.setattr(ad, "transmission", lambda *args: 1e-305)
+    monkeypatch.setattr(ad, "transmission", lambda *args, **kwargs: 1e-305)
     result = att.read_state(strict=True)
     assert result["transmission"] == 1e-305
     assert result["attenuation_factor"] > _ad_MAX_FACTOR
-    monkeypatch.setattr(ad, "transmission", lambda *args: 0.0)
+    monkeypatch.setattr(ad, "transmission", lambda *args, **kwargs: 0.0)
     with pytest.raises(ValueError, match="factor/transmission"):
         att.read_state(strict=True)
     assert att.read_state()["attenuation_factor"] == _ad_MAX_FACTOR
@@ -277,9 +277,11 @@ def test_state_md_shape():
     att = AttenuatorSet("", name="attenuation", banks=[b1, b2], bank_prefixes=["1", "2"])
     b2.f1.status.sim_put("Open")     # Mo 20um
     md = att.state_md()
-    assert set(md) == {"foils", "attenuation_factor", "transmission", "energy_eV", "description"}
+    from smi_beamline.devices import attenuator_data as ad
+    assert set(md) == {"foils", "attenuation_factor", "transmission", "energy_eV", "description", "calibration_id"}
     assert "att2_1" in md["foils"]
-    assert md["foils"]["att2_1"] == {"material": "Mo_20um", "thickness": "1x"}
+    assert md["foils"]["att2_1"] == {"material": "Mo_20um", "thickness": "1x", **ad.calibration_metadata("2_1")}
+    assert md["calibration_id"] == ad.CALIBRATION_ID
     assert md["attenuation_factor"] > 1.0
 
 

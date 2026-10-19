@@ -5,6 +5,35 @@ draft and instructions are in [attenuator_ab.py](attenuator_ab.py) and
 [README.md](README.md). Statistical tables below are planning estimates; use the
 executable preview for the actual chosen A/B list and exposure duration.
 
+## Current commissioning decision: 8.8 keV and above
+
+**Live update:** `2_6` (Al 204 µm) is excluded after insertion failures. The
+regenerated schedule has 130 tests / 650 pairs / 1,300 frames; at 10 s per frame
+it is estimated at 483 minutes. All 23 remaining foils retain two-energy coverage.
+The 24-foil estimates below precede this exclusion; use the current README and
+executable preview for acquisition.
+
+The executable schedule now uses **8.8, 16, and 19.5 keV** and rejects energies
+below 8.8 keV. The 6 keV point was dropped because observed higher-harmonic
+contributions compromise the monochromatic analysis. The four-energy calculations
+below are retained as historical design comparisons, not the current run list.
+
+The current design retains independently identifiable measurements at two or more
+energies for all 24 foils. It uses five 5 s A/B pairs per test, with beam centroid,
+width and off-axis intensity diagnostics on the same frames. A 10 s complete
+stack-change estimate and two 30 s sensitivity waits give approximately **391 minutes total** for 136 tests,
+680 pairs and 1,360 frames at 5 s. The main ROI is 40 × 40 pixels. No dark frames
+are acquired; the detector controls the exposure shutter and online reduction
+assumes zero background. The dark-measurement recommendations below describe the
+original protocol. See the [current sequence and precision table](README.md#current-three-energy-commissioning-sequence).
+
+The principal compromise is the second-energy sensitivity of thin Al: ideal
+cross-energy thickness-scale uncertainties are about 2.02%, 0.98% and 0.53%
+(1 sigma) for 9, 18 and 36 µm respectively. These do not meet the original
+1% discrepancy at 3-sigma goal. Use measured scatter and residuals to decide on
+follow-up acquisition; removing 6 keV does not itself establish harmonic purity
+at the remaining energies.
+
 ## Goals
 
 1. Assuming the specified material, determine an independent effective thickness
@@ -99,10 +128,10 @@ check, not a prediction of experimental precision or a proposed exhaustive scan.
 The same coverage and full ranks persist for the narrower nominal window
 `3e-9 <= T <= 3e-7`, leaving some margin for thickness errors.
 
-### Recommended initial energies
+### Original four-energy comparison (superseded for acquisition)
 
-Use **6, 8.8, 16, and 19.5 keV**, selecting a compact, well-conditioned set of
-stacks at each energy:
+The original design considered **6, 8.8, 16, and 19.5 keV**, selecting a compact,
+well-conditioned set of stacks at each energy:
 
 - Thin Al: prioritize 6 and 8.8 keV for meaningful thickness sensitivity.
   For example, 9 µm Al transmits about 0.765 at 6 keV but 0.992 at 19.5 keV.
@@ -116,7 +145,8 @@ stacks at each energy:
 This gives every foil at least two independently identifiable energy points.
 If minimizing energy changes is paramount, 19 and 19.5 keV both support all
 24 positions, but that close pair is a weak material test and poorly sensitive
-to thin Al. The wider four-energy set is preferable.
+to thin Al. In the monochromatic model the wider four-energy set is preferable;
+the current schedule omits 6 keV because of the observed harmonic contribution.
 
 The 20 keV upper bound does not provide a clean above-edge point for the Mo K
 edge near 20.0 keV. The existing 46 eV grid interpolates across that edge, so a

@@ -191,6 +191,7 @@ def patch_resource(doc):
 tiled_writing_client_sql = from_uri(
     "https://tiled.nsls2.bnl.gov", api_key=os.environ["TILED_BLUESKY_WRITING_API_KEY_SMI"]
 )["smi/migration"]
+tiled_writing_client_sql.context.http_client.headers["tiled-qos"] = "acquisition"
 tw = TiledWriter(tiled_writing_client_sql, batch_size=10000,
                  backup_directory=f"{TILED_BACKUP_ROOT}/sql",
                  patches={"resource": patch_resource, "descriptor": patch_descriptor})

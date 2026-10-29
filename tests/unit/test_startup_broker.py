@@ -44,6 +44,9 @@ def test_startup_uses_remote_broker_and_preserves_callbacks(monkeypatch, worker)
                         lambda self, name, doc: bec_documents.append(name))
     
     class CallableNamespace(SimpleNamespace):
+        def __hash__(self):
+            return id(self)  # Uses the object's unique memory address
+
         def __call__(self, name, doc):
             documents.append(name)
 
